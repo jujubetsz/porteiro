@@ -1,0 +1,12 @@
+Host production
+  HostName prod.example.test
+  User deploy
+  Port 2222
+  ProxyJump bastion
+
+Host staging
+  HostName staging.example.test
+  User deploy
+
+Host *.internal
+  User operator

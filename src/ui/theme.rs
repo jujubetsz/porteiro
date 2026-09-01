@@ -1,0 +1,11 @@
+use ratatui::style::Color;
+
+pub const BG: Color = Color::Rgb(0x15, 0x17, 0x1c);
+pub const TEXT: Color = Color::Rgb(0xcf, 0xd2, 0xd6);
+pub const HEADER_BG: Color = Color::Rgb(0x35, 0x33, 0x8a);
+pub const HEADER_FG: Color = Color::Rgb(0xe8, 0xe8, 0xf2);
+pub const ACCENT: Color = Color::Rgb(0xe2, 0xa5, 0x54);
+pub const IDENT: Color = Color::Rgb(0x51, 0xc9, 0xd4);
+pub const BAD: Color = Color::Rgb(0xff, 0x6b, 0x8a);
+pub const MUTED: Color = Color::Rgb(0x8b, 0x90, 0x9a);
+pub const SELECT_BG: Color = Color::Rgb(0x27, 0x4a, 0x44);
