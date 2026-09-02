@@ -102,7 +102,8 @@ logic testable without a real terminal or network.
 - `i`: open technical details as an overlay.
 - `r`: reload the SSH config.
 - `v`: cycle the `-v` verbosity of the next connection (off, 1, 2, 3). The
-  status line shows the resulting flag; `Enter` passes it as argv items.
+  selected row shows the flag as a badge, the `Enter` hint and status line
+  repeat it, and `Enter` passes it as argv items.
 - `?`: toggle help.
 - `q` or `Ctrl-C`: quit.
 

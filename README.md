@@ -16,7 +16,7 @@ files.
 ╭ Hosts - 2 shown / 2 total ─────────────────────────────────╮╭ Details ───────────────────────────╮
 │  Alias                  HostName                     Port  ││Alias        production             │
 │› production             prod.example.test            2222  ││HostName     prod.example.test      │
-│› staging                staging.example.test         -     ││User         deploy                 │
+│  staging                staging.example.test         -     ││User         deploy                 │
 │                                                            ││Port         2222                   │
 │                                                            ││ProxyJump    bastion                │
 │                                                            ││ProxyCommand -                      │
@@ -27,7 +27,7 @@ files.
 │                                                            ││             ~/.ssh/id_ed25519_sk   │
 ╰────────────────────────────────────────────────────────────╯╰────────────────────────────────────╯
  2 host(s) | ~/.ssh/config
- j/k move   / search   Enter connect   i details   r reload   ? help   q quit
+ j/k move  / search  Enter connect  i details  r reload  v verbose  ? help  q quit
 ```
 
 ## Features
@@ -92,8 +92,9 @@ OpenSSH-compatible executable and is useful when `ssh` is not on `PATH`.
 | `?` | Toggle help |
 | `q` / `Ctrl-C` | Quit |
 
-The status line shows the verbosity flag that `Enter` will pass to `ssh`, so
-you can debug a failing connection without leaving the list.
+The selected host shows a badge with the pending flag, and the `Enter` hint
+and status line repeat it, so you can debug a failing connection without
+leaving the list.
 
 Porteiro exits after the SSH session ends and returns the SSH process exit
 status to the calling shell. On Unix, a session terminated by a signal returns

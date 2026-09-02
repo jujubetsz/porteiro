@@ -89,13 +89,25 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_hints(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.filter_focused {
-        " type to search   Enter accept   Esc clear"
+    let line = if app.filter_focused {
+        Line::from(" type to search   Enter accept   Esc clear")
     } else {
-        " j/k move  / search  Enter connect  i details  r reload  v verbose  ? help  q quit"
+        let mut spans = vec![Span::raw(" j/k move  / search  Enter connect")];
+        if let Some(flag) = app.verbosity_flag() {
+            spans.push(Span::styled(
+                format!(" {flag}"),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::raw(
+            "  i details  r reload  v verbose  ? help  q quit",
+        ));
+        Line::from(spans)
     };
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().bg(theme::BG).fg(theme::MUTED)),
+        Paragraph::new(line).style(Style::default().bg(theme::BG).fg(theme::MUTED)),
         area,
     );
 }
@@ -212,12 +224,41 @@ mod tests {
         assert!(screen.contains(" Help ") && screen.contains("toggle help"));
     }
 
+    fn line_containing(screen: &str, needle: &str) -> String {
+        screen
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line contains {needle:?}:\n{screen}"))
+            .to_string()
+    }
+
     #[test]
-    fn verbosity_is_announced_in_the_status_line_and_help() {
+    fn only_the_selected_row_carries_the_marker() {
         let mut app = app();
-        assert!(!rendered(&app, 120, 24).contains("| ssh -v"));
+        let screen = rendered(&app, 120, 24);
+        assert!(line_containing(&screen, "api.internal").starts_with("│›"));
+        assert!(line_containing(&screen, "staging.internal").starts_with("│ "));
+
+        app.selected = 1;
+        let screen = rendered(&app, 120, 24);
+        assert!(line_containing(&screen, "api.internal").starts_with("│ "));
+        assert!(line_containing(&screen, "staging.internal").starts_with("│›"));
+    }
+
+    #[test]
+    fn verbosity_badges_the_selected_row_and_the_enter_hint() {
+        let mut app = app();
+        let screen = rendered(&app, 120, 24);
+        assert!(!screen.contains("| ssh -v") && !screen.contains("connect -v"));
+
         app.verbosity = 2;
-        assert!(rendered(&app, 120, 24).contains("2 host(s) | ssh -vv |"));
+        let screen = rendered(&app, 120, 24);
+        let selected_row = line_containing(&screen, "api.internal");
+        assert!(selected_row.contains("production   -vv "), "{selected_row}");
+        assert!(!line_containing(&screen, "staging.internal").contains("-vv"));
+        assert!(screen.contains("Enter connect -vv  i details"));
+        assert!(screen.contains("2 host(s) | ssh -vv |"));
+
         app.show_help = true;
         assert!(rendered(&app, 120, 24).contains("cycle ssh verbosity"));
     }

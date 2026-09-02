@@ -2,7 +2,7 @@ use super::{theme, App};
 use crate::catalog::Host;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
@@ -112,10 +112,16 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             .fg(theme::MUTED)
             .add_modifier(Modifier::BOLD),
     );
-    let rows = visible
-        .iter()
-        .filter_map(|index| app.catalog.hosts().get(*index))
-        .map(|host| row(host, &columns));
+    let selected = app.selected.min(visible.len().saturating_sub(1));
+    let badge = app.verbosity_flag();
+    let rows = visible.iter().enumerate().filter_map(|(position, index)| {
+        let host = app.catalog.hosts().get(*index)?;
+        let is_selected = position == selected;
+        let badge = badge.as_deref().filter(|_| is_selected);
+        Some(row(host, &columns, is_selected, badge))
+    });
+    // The selected row is styled here rather than through the table's
+    // highlight style, which would paint over the verbosity badge.
     let table = Table::new(
         rows,
         columns
@@ -125,25 +131,18 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     )
     .header(header)
     .block(block)
-    .row_highlight_style(
-        Style::default()
-            .bg(theme::SELECT_BG)
-            .add_modifier(Modifier::BOLD),
-    )
     .column_spacing(1);
     let mut state = TableState::default();
-    state.select(Some(app.selected.min(visible.len().saturating_sub(1))));
+    state.select(Some(selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn row(host: &Host, columns: &[Column]) -> Row<'static> {
+fn row(host: &Host, columns: &[Column], selected: bool, badge: Option<&str>) -> Row<'static> {
     let cells: Vec<Cell> = columns
         .iter()
         .map(|column| match column {
-            Column::Marker => Cell::from("›"),
-            Column::Alias => {
-                Cell::from(host.alias.clone()).style(Style::default().fg(theme::IDENT))
-            }
+            Column::Marker => Cell::from(if selected { "›" } else { " " }),
+            Column::Alias => Cell::from(alias_line(&host.alias, badge)),
             Column::Hostname => {
                 Cell::from(host.hints.hostname.clone().unwrap_or_else(|| "-".into()))
             }
@@ -152,7 +151,30 @@ fn row(host: &Host, columns: &[Column]) -> Row<'static> {
             Column::Source => Cell::from(source_label(host)),
         })
         .collect();
-    Row::new(cells).style(Style::default().fg(theme::TEXT))
+    let mut style = Style::default().fg(theme::TEXT);
+    if selected {
+        style = style.bg(theme::SELECT_BG).add_modifier(Modifier::BOLD);
+    }
+    Row::new(cells).style(style)
+}
+
+/// The alias, followed by an inverted badge with the pending `-v` flag.
+fn alias_line(alias: &str, badge: Option<&str>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        alias.to_string(),
+        Style::default().fg(theme::IDENT),
+    )];
+    if let Some(flag) = badge {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(" {flag} "),
+            Style::default()
+                .fg(theme::BG)
+                .bg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn source_label(host: &Host) -> String {
