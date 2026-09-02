@@ -70,31 +70,10 @@ impl Catalog {
                     path: config_path.to_path_buf(),
                 }
             } else {
-                CatalogError::Read {
-                    path: config_path.to_path_buf(),
-                    source,
-                }
+                read_error(config_path)(source)
             }
         })?;
-
-        let mut builder = Builder::new(identity);
-        let mut active_hosts = Vec::new();
-        let mut has_unknown_host = false;
-        let mut include_chain = Vec::new();
-        builder.parse_file(
-            &canonical,
-            false,
-            &mut active_hosts,
-            &mut has_unknown_host,
-            &mut include_chain,
-        )?;
-        builder.retain_reachable_hosts(&canonical)?;
-
-        Ok(Self {
-            config_path: config_path.to_path_buf(),
-            hosts: builder.hosts,
-            warnings: builder.warnings,
-        })
+        Builder::new(identity).into_catalog(config_path, &canonical)
     }
 
     pub fn config_path(&self) -> &Path {
@@ -121,11 +100,7 @@ impl Catalog {
             .enumerate()
             .filter_map(|(index, host)| host.search_score(query).map(|score| (index, score)))
             .collect();
-        matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| left_index.cmp(right_index))
-        });
+        matches.sort_by_key(|&(index, score)| (std::cmp::Reverse(score), index));
         matches.into_iter().map(|(index, _)| index).collect()
     }
 
@@ -174,24 +149,49 @@ pub enum CatalogError {
     IncludeCycle { path: PathBuf },
 }
 
+fn syntax(path: &Path, line: usize) -> impl Fn(String) -> CatalogError + '_ {
+    move |message| CatalogError::Syntax {
+        path: path.to_path_buf(),
+        line,
+        message,
+    }
+}
+
+fn read_error(path: &Path) -> impl Fn(io::Error) -> CatalogError + '_ {
+    move |source| CatalogError::Read {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Canonicalizes a configuration file being entered, enforcing OpenSSH's
+/// include depth limit and rejecting a file that is already being parsed.
+fn enter_include(stack: &mut HashSet<PathBuf>, path: &Path) -> Result<PathBuf, CatalogError> {
+    if stack.len() > MAX_INCLUDE_DEPTH {
+        return Err(CatalogError::IncludeDepth {
+            path: path.to_path_buf(),
+            limit: MAX_INCLUDE_DEPTH,
+        });
+    }
+    let canonical = fs::canonicalize(path).map_err(read_error(path))?;
+    if !stack.insert(canonical.clone()) {
+        return Err(CatalogError::IncludeCycle { path: canonical });
+    }
+    Ok(canonical)
+}
+
 fn read_config_contents(
     path: &Path,
     is_include: bool,
     local_uid: u32,
 ) -> Result<String, CatalogError> {
-    let mut file = fs::File::open(path).map_err(|source| CatalogError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut file = fs::File::open(path).map_err(read_error(path))?;
 
     #[cfg(unix)]
     if is_include {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata = file.metadata().map_err(|source| CatalogError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let metadata = file.metadata().map_err(read_error(path))?;
         let owner = metadata.uid();
         let mode = metadata.mode() & 0o7777;
         if (owner != 0 && owner != local_uid) || mode & 0o022 != 0 {
@@ -209,10 +209,7 @@ fn read_config_contents(
 
     let mut contents = String::new();
     file.read_to_string(&mut contents)
-        .map_err(|source| CatalogError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        .map_err(read_error(path))?;
     Ok(contents)
 }
 
@@ -220,8 +217,7 @@ fn read_config_contents(
 struct AccountIdentity {
     username: String,
     home: PathBuf,
-    uid: String,
-    uid_number: u32,
+    uid: u32,
 }
 
 #[cfg(test)]
@@ -230,8 +226,7 @@ impl AccountIdentity {
         Self {
             username: "tester".to_string(),
             home,
-            uid: test_uid().to_string(),
-            uid_number: test_uid(),
+            uid: test_uid(),
         }
     }
 }
@@ -269,8 +264,7 @@ struct Builder {
     environment: HashMap<String, String>,
     local_hostname: String,
     local_username: String,
-    local_uid: String,
-    local_uid_number: u32,
+    local_uid: u32,
     hosts: Vec<Host>,
     host_origins: Vec<DeclarationOrigin>,
     host_key_aliases: HashMap<usize, String>,
@@ -293,7 +287,6 @@ impl Builder {
             local_hostname: system_hostname().unwrap_or_else(|_| "localhost".to_string()),
             local_username: identity.username,
             local_uid: identity.uid,
-            local_uid_number: identity.uid_number,
             hosts: Vec::new(),
             host_origins: Vec::new(),
             host_key_aliases: HashMap::new(),
@@ -305,6 +298,18 @@ impl Builder {
         }
     }
 
+    /// Discovers every candidate declaration under `root`, keeps the aliases
+    /// an exact per-alias pass proves reachable, and reports them as `config_path`.
+    fn into_catalog(mut self, config_path: &Path, root: &Path) -> Result<Catalog, CatalogError> {
+        self.parse_file(root, false, &mut Vec::new(), &mut false, &mut Vec::new())?;
+        self.retain_reachable_hosts(root)?;
+        Ok(Catalog {
+            config_path: config_path.to_path_buf(),
+            hosts: self.hosts,
+            warnings: self.warnings,
+        })
+    }
+
     fn parse_file(
         &mut self,
         path: &Path,
@@ -313,26 +318,13 @@ impl Builder {
         has_unknown_host: &mut bool,
         include_chain: &mut Vec<IncludeHop>,
     ) -> Result<(), CatalogError> {
-        if self.include_stack.len() > MAX_INCLUDE_DEPTH {
-            return Err(CatalogError::IncludeDepth {
-                path: path.to_path_buf(),
-                limit: MAX_INCLUDE_DEPTH,
-            });
-        }
-        let canonical = fs::canonicalize(path).map_err(|source| CatalogError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let canonical = enter_include(&mut self.include_stack, path)?;
         if !is_include && include_chain.is_empty() {
             self.discovery_root = canonical
                 .parent()
                 .unwrap_or_else(|| Path::new("/"))
                 .to_path_buf();
         }
-        if !self.include_stack.insert(canonical.clone()) {
-            return Err(CatalogError::IncludeCycle { path: canonical });
-        }
-
         let result = self.parse_file_contents(
             &canonical,
             is_include,
@@ -352,25 +344,20 @@ impl Builder {
         has_unknown_host: &mut bool,
         include_chain: &mut Vec<IncludeHop>,
     ) -> Result<(), CatalogError> {
-        let contents = read_config_contents(path, is_include, self.local_uid_number)?;
+        let contents = read_config_contents(path, is_include, self.local_uid)?;
 
         for (line_index, raw_line) in contents.lines().enumerate() {
             let line = line_index + 1;
-            let Some(directive) =
-                parse_directive(raw_line).map_err(|message| CatalogError::Syntax {
-                    path: path.to_path_buf(),
-                    line,
-                    message,
-                })?
-            else {
+            let Some(directive) = parse_directive(raw_line).map_err(syntax(path, line))? else {
                 continue;
             };
 
+            let arguments = &directive.arguments;
             match directive.keyword.as_str() {
                 "host" => self.start_host_block(
                     path,
                     line,
-                    &directive.arguments,
+                    arguments,
                     active_hosts,
                     has_unknown_host,
                     include_chain,
@@ -383,43 +370,45 @@ impl Builder {
                     self.parse_includes(
                         path,
                         line,
-                        &directive.arguments,
+                        arguments,
                         active_hosts,
                         has_unknown_host,
                         include_chain,
                     )?;
                 }
-                "hostname" => self.set_hint(active_hosts, Hint::Hostname, &directive.arguments),
-                "user" => self.set_hint(active_hosts, Hint::User, &directive.arguments),
+                "hostname" => {
+                    self.set_hint(active_hosts, arguments.first(), |hints| &mut hints.hostname)
+                }
+                "user" => self.set_hint(active_hosts, arguments.first(), |hints| &mut hints.user),
                 "port" => {
-                    self.set_port(path, line, active_hosts, &directive.arguments)?;
+                    let port = normalize_port(arguments).map_err(syntax(path, line))?;
+                    self.set_hint(active_hosts, Some(&port), |hints| &mut hints.port);
                 }
                 "canonicalizehostname" => {
-                    normalize_canonicalize_hostname(&directive.arguments).map_err(|message| {
-                        CatalogError::Syntax {
-                            path: path.to_path_buf(),
-                            line,
-                            message,
-                        }
-                    })?;
+                    normalize_canonicalize_hostname(arguments).map_err(syntax(path, line))?;
                 }
                 "canonicalizemaxdots" => {
-                    normalize_canonicalize_max_dots(&directive.arguments).map_err(|message| {
-                        CatalogError::Syntax {
-                            path: path.to_path_buf(),
-                            line,
-                            message,
-                        }
-                    })?;
+                    normalize_canonicalize_max_dots(arguments).map_err(syntax(path, line))?;
                 }
                 "proxyjump" => {
-                    self.set_proxy_jump(path, line, active_hosts, &directive.arguments)?;
+                    if let Some(raw) = arguments.first() {
+                        let host = normalize_proxy_jump(raw).map_err(syntax(path, line))?;
+                        self.update_proxy(active_hosts, |proxy| {
+                            proxy.set_jump(Truth::Yes, raw, &host)
+                        });
+                    }
                 }
-                "proxycommand" => {
-                    self.set_proxy_command(active_hosts, &directive.arguments);
-                }
+                "proxycommand" => self.update_proxy(active_hosts, |proxy| {
+                    proxy.set_command(Truth::Yes, arguments)
+                }),
                 "hostkeyalias" => {
-                    self.set_host_key_alias(active_hosts, &directive.arguments);
+                    if let Some(value) = arguments.first() {
+                        for index in active_hosts.iter() {
+                            self.host_key_aliases
+                                .entry(*index)
+                                .or_insert_with(|| value.clone());
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -483,241 +472,184 @@ impl Builder {
         has_unknown_host: &mut bool,
         include_chain: &mut Vec<IncludeHop>,
     ) -> Result<(), CatalogError> {
-        let mut include_contexts: Vec<Option<usize>> =
-            active_hosts.iter().copied().map(Some).collect();
+        let mut contexts: Vec<Option<usize>> = active_hosts.iter().copied().map(Some).collect();
         if active_hosts.is_empty() || *has_unknown_host {
-            include_contexts.push(None);
+            contexts.push(None);
         }
 
         for (pattern_index, raw_pattern) in patterns.iter().enumerate() {
-            let mut expanded_patterns = BTreeMap::new();
-            for context in &include_contexts {
-                match self.expand_include(raw_pattern, *context) {
-                    Ok(expanded) => {
-                        let needs_conservative_expansion =
-                            context.is_some() && expanded.needs_inherited_fallback;
-                        if expanded.used_unknown_target {
-                            self.warn_once(format!(
-                                "Include {raw_pattern:?} uses target-dependent tokens; scanning matching paths for host discovery"
-                            ));
-                        }
-                        let conservative = expanded.used_unknown_target;
-                        expanded_patterns
-                            .entry(expanded.path)
-                            .and_modify(|only_conservative| {
-                                *only_conservative &= conservative;
-                            })
-                            .or_insert(conservative);
-                        if needs_conservative_expansion {
-                            match self.expand_include(raw_pattern, None) {
-                                Ok(conservative) => {
-                                    self.warn_once(format!(
-                                        "Include {raw_pattern:?} uses target-dependent tokens; scanning matching paths for inherited SSH values"
-                                    ));
-                                    expanded_patterns.entry(conservative.path).or_insert(true);
-                                }
-                                Err(IncludeExpansionError::Ignored(message)) => {
-                                    self.warn_once(format!(
-                                        "cannot conservatively expand Include {raw_pattern:?} at {}:{line}: {message}",
-                                        source.display()
-                                    ));
-                                }
-                                Err(IncludeExpansionError::Fatal(message)) => {
-                                    return Err(CatalogError::Syntax {
-                                        path: source.to_path_buf(),
-                                        line,
-                                        message,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Err(IncludeExpansionError::Ignored(message)) => {
-                        self.warn_once(format!(
-                            "cannot expand Include {raw_pattern:?} at {}:{line}: {message}",
-                            source.display()
-                        ));
-                    }
-                    Err(IncludeExpansionError::Fatal(message)) => {
-                        return Err(CatalogError::Syntax {
-                            path: source.to_path_buf(),
-                            line,
-                            message,
-                        });
-                    }
-                }
-            }
-            if raw_pattern.contains("%j") {
-                match self.expand_include_with_empty_unknown_jump(raw_pattern) {
-                    Ok(expanded) => {
-                        expanded_patterns.entry(expanded.path).or_insert(true);
-                    }
-                    Err(IncludeExpansionError::Ignored(message)) => {
-                        self.warn_once(format!(
-                            "cannot conservatively expand empty %j in Include {raw_pattern:?} at {}:{line}: {message}",
-                            source.display()
-                        ));
-                    }
-                    Err(IncludeExpansionError::Fatal(message)) => {
-                        return Err(CatalogError::Syntax {
-                            path: source.to_path_buf(),
-                            line,
-                            message,
-                        });
-                    }
-                }
-            }
-
-            let mut paths = BTreeMap::new();
-            for (expanded, only_conservative) in expanded_patterns {
-                let pattern = collapse_repeated_stars(&expanded.to_string_lossy());
-                if only_conservative {
-                    let scan_boundaries = [self.discovery_root.as_path(), self.ssh_dir.as_path()];
-                    let (matches, warnings) = match conservative_include_matches(
-                        &pattern,
-                        &scan_boundaries,
-                    ) {
-                        Ok(result) => result,
-                        Err(error) => {
-                            self.warn_once(format!(
-                                "ignoring invalid Include pattern {raw_pattern:?} at {}:{line}: {error}",
-                                source.display()
-                            ));
-                            continue;
-                        }
-                    };
-                    for warning in warnings {
-                        self.warn_once(format!(
-                            "cannot inspect conservative Include match for {raw_pattern:?}: {warning}"
-                        ));
-                    }
-                    for path in matches {
-                        paths
-                            .entry(path)
-                            .and_modify(|existing| *existing &= only_conservative)
-                            .or_insert(only_conservative);
-                    }
-                    continue;
-                }
-                let matches = match glob_with(
-                    &pattern,
-                    MatchOptions {
-                        case_sensitive: true,
-                        require_literal_separator: true,
-                        require_literal_leading_dot: true,
-                    },
-                ) {
-                    Ok(matches) => matches,
-                    Err(error) => {
-                        // OpenSSH treats malformed glob syntax as an Include
-                        // with no matches. Token expansion can legitimately
-                        // create that shape, such as `[%n]` for `team/prod`.
-                        self.warn_once(format!(
-                            "ignoring invalid Include pattern {raw_pattern:?} at {}:{line}: {error}",
-                            source.display()
-                        ));
-                        continue;
-                    }
-                };
-                for entry in matches {
-                    match entry {
-                        Ok(path) => {
-                            paths
-                                .entry(path)
-                                .and_modify(|existing| *existing = false)
-                                .or_insert(false);
-                        }
-                        Err(error) => self.warn_once(format!(
-                            "cannot inspect Include match for {raw_pattern:?}: {error}"
-                        )),
-                    }
-                }
-            }
-
-            let containing_state = active_hosts.clone();
+            let paths = self.include_paths(source, line, raw_pattern, &contexts)?;
+            let containing_hosts = active_hosts.clone();
             let containing_unknown_host = *has_unknown_host;
             for (path, only_conservative) in paths {
-                *active_hosts = containing_state.clone();
+                *active_hosts = containing_hosts.clone();
                 *has_unknown_host = containing_unknown_host;
-                let included = match fs::canonicalize(&path) {
-                    Ok(included) => included,
-                    Err(source) => {
-                        let error = CatalogError::Read {
-                            path: path.clone(),
-                            source,
-                        };
-                        if only_conservative {
-                            self.warn_once(format!(
-                                "cannot parse conservative Include candidate {}: {error}",
-                                path.display()
-                            ));
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                };
-                if only_conservative && self.include_stack.contains(&included) {
-                    // The active include chain is already being parsed and
-                    // cannot contribute a new declaration by being scanned
-                    // again. Exact validation still reports a reachable cycle.
-                    continue;
-                }
-                include_chain.push(IncludeHop {
-                    source: source.to_path_buf(),
-                    line,
-                    pattern_index,
-                    included: included.clone(),
-                });
-                let result = self.parse_file(
-                    &included,
-                    true,
-                    active_hosts,
-                    has_unknown_host,
-                    include_chain,
-                );
-                include_chain.pop();
-                if let Err(error) = result {
-                    if only_conservative {
-                        self.warn_once(format!(
-                            "cannot parse conservative Include candidate {}: {error}",
-                            path.display()
-                        ));
-                    } else {
-                        return Err(error);
-                    }
+                let result =
+                    fs::canonicalize(&path)
+                        .map_err(read_error(&path))
+                        .and_then(|included| {
+                            if only_conservative && self.include_stack.contains(&included) {
+                                // The active include chain is already being parsed and
+                                // cannot contribute a new declaration by being scanned
+                                // again. Exact validation still reports a reachable cycle.
+                                return Ok(());
+                            }
+                            include_chain.push(IncludeHop {
+                                source: source.to_path_buf(),
+                                line,
+                                pattern_index,
+                                included: included.clone(),
+                            });
+                            let result = self.parse_file(
+                                &included,
+                                true,
+                                active_hosts,
+                                has_unknown_host,
+                                include_chain,
+                            );
+                            include_chain.pop();
+                            result
+                        });
+                match result {
+                    Ok(()) => {}
+                    Err(error) if only_conservative => self.warn_once(format!(
+                        "cannot parse conservative Include candidate {}: {error}",
+                        path.display()
+                    )),
+                    Err(error) => return Err(error),
                 }
             }
-            *active_hosts = containing_state;
+            *active_hosts = containing_hosts;
             *has_unknown_host = containing_unknown_host;
         }
         Ok(())
     }
 
-    fn expand_include(
-        &self,
-        pattern: &str,
-        host_index: Option<usize>,
-    ) -> Result<ExpandedInclude, IncludeExpansionError> {
-        let target = host_index.map(|index| self.include_target(index));
-        self.expand_include_for_target(pattern, target.as_ref())
+    /// Expands one Include pattern for every active host context and resolves
+    /// the resulting globs. Each path maps to whether it was reached only by
+    /// a conservative scan for target-dependent tokens.
+    fn include_paths(
+        &mut self,
+        source: &Path,
+        line: usize,
+        raw_pattern: &str,
+        contexts: &[Option<usize>],
+    ) -> Result<BTreeMap<PathBuf, bool>, CatalogError> {
+        let mut patterns = BTreeMap::new();
+        for context in contexts {
+            let target = context.map(|index| self.include_target(index));
+            let Some(expanded) =
+                self.expand_or_warn(source, line, raw_pattern, target.as_ref(), false, "expand")?
+            else {
+                continue;
+            };
+            let conservative = expanded.tokens.unknown_target;
+            if conservative {
+                self.warn_once(format!(
+                    "Include {raw_pattern:?} uses target-dependent tokens; scanning matching paths for host discovery"
+                ));
+            }
+            patterns
+                .entry(expanded.path)
+                .and_modify(|only_conservative| *only_conservative &= conservative)
+                .or_insert(conservative);
+            if context.is_some() && expanded.tokens.inherited_fallback {
+                if let Some(fallback) = self.expand_or_warn(
+                    source,
+                    line,
+                    raw_pattern,
+                    None,
+                    false,
+                    "conservatively expand",
+                )? {
+                    self.warn_once(format!(
+                        "Include {raw_pattern:?} uses target-dependent tokens; scanning matching paths for inherited SSH values"
+                    ));
+                    patterns.entry(fallback.path).or_insert(true);
+                }
+            }
+        }
+        if raw_pattern.contains("%j") {
+            if let Some(expanded) = self.expand_or_warn(
+                source,
+                line,
+                raw_pattern,
+                None,
+                true,
+                "conservatively expand empty %j in",
+            )? {
+                patterns.entry(expanded.path).or_insert(true);
+            }
+        }
+
+        let mut paths = BTreeMap::new();
+        for (expanded, only_conservative) in patterns {
+            let pattern = collapse_repeated_stars(&expanded.to_string_lossy());
+            let result = if only_conservative {
+                let boundaries = [self.discovery_root.as_path(), self.ssh_dir.as_path()];
+                conservative_include_matches(&pattern, &boundaries)
+            } else {
+                exact_include_matches(&pattern)
+            };
+            let (matches, warnings) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    // OpenSSH treats malformed glob syntax as an Include
+                    // with no matches. Token expansion can legitimately
+                    // create that shape, such as `[%n]` for `team/prod`.
+                    self.warn_once(format!(
+                        "ignoring invalid Include pattern {raw_pattern:?} at {}:{line}: {error}",
+                        source.display()
+                    ));
+                    continue;
+                }
+            };
+            let kind = if only_conservative {
+                "conservative Include match"
+            } else {
+                "Include match"
+            };
+            for warning in warnings {
+                self.warn_once(format!(
+                    "cannot inspect {kind} for {raw_pattern:?}: {warning}"
+                ));
+            }
+            for path in matches {
+                if only_conservative {
+                    paths.entry(path).or_insert(true);
+                } else {
+                    paths.insert(path, false);
+                }
+            }
+        }
+        Ok(paths)
     }
 
-    fn expand_include_for_target(
-        &self,
-        pattern: &str,
+    /// Expands an Include pattern, turning failures OpenSSH ignores into a
+    /// warning prefixed by `verb` and invalid token syntax into an error.
+    fn expand_or_warn(
+        &mut self,
+        source: &Path,
+        line: usize,
+        raw_pattern: &str,
         target: Option<&IncludeTarget>,
-    ) -> Result<ExpandedInclude, IncludeExpansionError> {
-        self.expand_include_for_target_mode(pattern, target, false)
+        empty_unknown_jump: bool,
+        verb: &str,
+    ) -> Result<Option<ExpandedInclude>, CatalogError> {
+        match self.expand_include(raw_pattern, target, empty_unknown_jump) {
+            Ok(expanded) => Ok(Some(expanded)),
+            Err(IncludeExpansionError::Ignored(message)) => {
+                self.warn_once(format!(
+                    "cannot {verb} Include {raw_pattern:?} at {}:{line}: {message}",
+                    source.display()
+                ));
+                Ok(None)
+            }
+            Err(IncludeExpansionError::Fatal(message)) => Err(syntax(source, line)(message)),
+        }
     }
 
-    fn expand_include_with_empty_unknown_jump(
-        &self,
-        pattern: &str,
-    ) -> Result<ExpandedInclude, IncludeExpansionError> {
-        self.expand_include_for_target_mode(pattern, None, true)
-    }
-
-    fn expand_include_for_target_mode(
+    fn expand_include(
         &self,
         pattern: &str,
         target: Option<&IncludeTarget>,
@@ -725,30 +657,23 @@ impl Builder {
     ) -> Result<ExpandedInclude, IncludeExpansionError> {
         let environment = expand_environment(pattern, &self.environment)
             .map_err(IncludeExpansionError::Ignored)?;
-        let tokens = self
-            .expand_include_tokens_mode(&environment, target, empty_unknown_jump)
+        let expanded = self
+            .expand_include_tokens(&environment, target, empty_unknown_jump)
             .map_err(IncludeExpansionError::Fatal)?;
-        let expanded_tilde = self
-            .expand_tilde(&tokens.value)
+        let path = self
+            .expand_tilde(&expanded.value)
             .map_err(IncludeExpansionError::Ignored)?;
-        let path = Path::new(&expanded_tilde);
-        if path.is_absolute() {
-            Ok(ExpandedInclude {
-                path: path.to_path_buf(),
-                used_unknown_target: tokens.used_unknown_target,
-                needs_inherited_fallback: tokens.needs_inherited_fallback,
-                uncertain_target: tokens.uncertain_target,
-            })
+        // OpenSSH resolves relative Includes in a user config from ~/.ssh,
+        // not from the directory of the file containing the directive.
+        let path = if path.is_absolute() {
+            path
         } else {
-            // OpenSSH resolves relative Includes in a user config from ~/.ssh,
-            // not from the directory of the file containing the directive.
-            Ok(ExpandedInclude {
-                path: self.ssh_dir.join(path),
-                used_unknown_target: tokens.used_unknown_target,
-                needs_inherited_fallback: tokens.needs_inherited_fallback,
-                uncertain_target: tokens.uncertain_target,
-            })
-        }
+            self.ssh_dir.join(path)
+        };
+        Ok(ExpandedInclude {
+            path,
+            tokens: expanded.tokens,
+        })
     }
 
     fn expand_tilde(&self, pattern: &str) -> Result<PathBuf, String> {
@@ -773,118 +698,77 @@ impl Builder {
             .ok_or_else(|| format!("unknown user in Include path: ~{username}"))
     }
 
-    #[cfg(test)]
     fn expand_include_tokens(
-        &self,
-        pattern: &str,
-        target: Option<&IncludeTarget>,
-    ) -> Result<ExpandedTokens, String> {
-        self.expand_include_tokens_mode(pattern, target, false)
-    }
-
-    fn expand_include_tokens_mode(
         &self,
         pattern: &str,
         target: Option<&IncludeTarget>,
         empty_unknown_jump: bool,
     ) -> Result<ExpandedTokens, String> {
-        let mut output = String::with_capacity(pattern.len());
+        let mut value = String::with_capacity(pattern.len());
+        let mut tokens = TokenUse::default();
         let mut characters = pattern.chars();
-        let mut used_unknown_target = false;
-        let mut needs_inherited_fallback = false;
-        let mut uncertain_target = false;
 
         while let Some(character) = characters.next() {
             if character != '%' {
-                output.push(character);
+                value.push(character);
                 continue;
             }
             let token = characters
                 .next()
                 .ok_or_else(|| "trailing '%' token".to_string())?;
+            let local = match token {
+                '%' => Some("%".to_string()),
+                'd' => Some(self.home.to_string_lossy().into_owned()),
+                'i' => Some(self.local_uid.to_string()),
+                'L' => Some(
+                    self.local_hostname
+                        .split('.')
+                        .next()
+                        .unwrap_or(&self.local_hostname)
+                        .to_string(),
+                ),
+                'l' => Some(self.local_hostname.clone()),
+                'u' => Some(self.local_username.clone()),
+                'C' | 'h' | 'j' | 'k' | 'n' | 'p' | 'r' => None,
+                _ => return Err(format!("unsupported Include token %{token}")),
+            };
+            if let Some(local) = local {
+                value.push_str(&local);
+                continue;
+            }
             // %n is always the original command-line host. The remaining
             // target values may be inherited from broader Host blocks and
             // therefore need a conservative discovery fallback.
-            if matches!(token, 'C' | 'h' | 'j' | 'k' | 'p' | 'r') {
-                needs_inherited_fallback = true;
-            }
-            let replacement = match token {
-                '%' => "%".to_string(),
-                'd' => self.home.to_string_lossy().into_owned(),
-                'i' => self.local_uid.clone(),
-                'L' => self
-                    .local_hostname
-                    .split('.')
-                    .next()
-                    .unwrap_or(&self.local_hostname)
-                    .to_string(),
-                'l' => self.local_hostname.clone(),
-                'u' => self.local_username.clone(),
-                'C' => match target {
-                    Some(target) => {
-                        connection_hash(&self.local_hostname, target).unwrap_or_else(|| {
-                            uncertain_target = true;
-                            "*".to_string()
-                        })
-                    }
-                    None => {
-                        used_unknown_target = true;
+            tokens.inherited_fallback |= token != 'n';
+            let replacement = match target {
+                None => {
+                    tokens.unknown_target = true;
+                    if token == 'j' && empty_unknown_jump {
+                        String::new()
+                    } else {
                         "*".to_string()
                     }
-                },
-                'h' => target_value(
-                    target,
-                    |target| target.hostname.as_ref(),
-                    "*",
-                    &mut used_unknown_target,
-                    &mut uncertain_target,
-                ),
-                'j' => target_value(
-                    target,
-                    |target| target.jump_host.as_ref(),
-                    if empty_unknown_jump { "" } else { "*" },
-                    &mut used_unknown_target,
-                    &mut uncertain_target,
-                ),
-                'k' => target_value(
-                    target,
-                    |target| target.key_alias.as_ref(),
-                    "*",
-                    &mut used_unknown_target,
-                    &mut uncertain_target,
-                ),
-                'n' => target_value(
-                    target,
-                    |target| Some(&target.original_host),
-                    "*",
-                    &mut used_unknown_target,
-                    &mut uncertain_target,
-                ),
-                'p' => target_value(
-                    target,
-                    |target| target.port.as_ref(),
-                    "*",
-                    &mut used_unknown_target,
-                    &mut uncertain_target,
-                ),
-                'r' => target_value(
-                    target,
-                    |target| target.remote_user.as_ref(),
-                    "*",
-                    &mut used_unknown_target,
-                    &mut uncertain_target,
-                ),
-                _ => return Err(format!("unsupported Include token %{token}")),
+                }
+                Some(target) => {
+                    let known = match token {
+                        'C' => connection_hash(&self.local_hostname, target),
+                        'h' => target.hostname.clone(),
+                        'j' => target.jump_host.clone(),
+                        'k' => target.key_alias.clone(),
+                        'n' => Some(target.original_host.clone()),
+                        'p' => target.port.clone(),
+                        _ => target.remote_user.clone(),
+                    };
+                    known.unwrap_or_else(|| {
+                        tokens.uncertain_target = true;
+                        "*".to_string()
+                    })
+                }
             };
-            output.push_str(&replacement);
+            value.push_str(&replacement);
         }
 
-        Ok(ExpandedTokens {
-            value: output,
-            used_unknown_target,
-            needs_inherited_fallback,
-            uncertain_target,
-        })
+        Ok(ExpandedTokens { value, tokens })
     }
 
     fn include_target(&self, index: usize) -> IncludeTarget {
@@ -898,21 +782,7 @@ impl Builder {
         let jump_host = self
             .proxy_options
             .get(&index)
-            .map(ProxyOptions::jump_host)
-            .unwrap_or_else(|| {
-                if host.hints.proxy_command.is_some() {
-                    Some(String::new())
-                } else {
-                    host.hints
-                        .proxy_jump
-                        .as_deref()
-                        .map(normalize_proxy_jump)
-                        .transpose()
-                        .ok()
-                        .flatten()
-                        .or_else(|| Some(String::new()))
-                }
-            })
+            .map_or_else(|| Some(String::new()), ProxyOptions::jump_host)
             .unwrap_or_else(|| "*".to_string());
         IncludeTarget {
             original_host: host.alias.clone(),
@@ -934,47 +804,27 @@ impl Builder {
         }
     }
 
-    fn set_proxy_jump(
+    fn update_proxy(&mut self, active_hosts: &[usize], update: impl Fn(&mut ProxyOptions)) {
+        for index in active_hosts {
+            let proxy = self.proxy_options.entry(*index).or_default();
+            update(proxy);
+            let hints = &mut self.hosts[*index].hints;
+            hints.proxy_jump = proxy.jump_hint();
+            hints.proxy_command = proxy.command_hint();
+        }
+    }
+
+    /// Records the first value of a declaration hint for every active host.
+    fn set_hint(
         &mut self,
-        source: &Path,
-        line: usize,
         active_hosts: &[usize],
-        arguments: &[String],
-    ) -> Result<(), CatalogError> {
-        let Some(raw) = arguments.first() else {
-            return Ok(());
-        };
-        let host = normalize_proxy_jump(raw).map_err(|message| CatalogError::Syntax {
-            path: source.to_path_buf(),
-            line,
-            message,
-        })?;
-        for index in active_hosts {
-            let proxy = self.proxy_options.entry(*index).or_default();
-            proxy.set_jump(Truth::Yes, raw, &host);
-            self.hosts[*index].hints.proxy_jump = proxy.jump_hint();
-            self.hosts[*index].hints.proxy_command = proxy.command_hint();
-        }
-        Ok(())
-    }
-
-    fn set_proxy_command(&mut self, active_hosts: &[usize], arguments: &[String]) {
-        for index in active_hosts {
-            let proxy = self.proxy_options.entry(*index).or_default();
-            proxy.set_command(Truth::Yes, arguments);
-            self.hosts[*index].hints.proxy_jump = proxy.jump_hint();
-            self.hosts[*index].hints.proxy_command = proxy.command_hint();
-        }
-    }
-
-    fn set_host_key_alias(&mut self, active_hosts: &[usize], arguments: &[String]) {
-        let Some(value) = arguments.first() else {
-            return;
-        };
-        for index in active_hosts {
-            self.host_key_aliases
-                .entry(*index)
-                .or_insert_with(|| value.clone());
+        value: Option<&String>,
+        slot: fn(&mut HostHints) -> &mut Option<String>,
+    ) {
+        if let Some(value) = value {
+            for index in active_hosts {
+                slot(&mut self.hosts[*index].hints).get_or_insert_with(|| value.clone());
+            }
         }
     }
 
@@ -1013,40 +863,6 @@ impl Builder {
         self.hosts = reachable;
         self.host_key_aliases.clear();
         self.proxy_options.clear();
-        Ok(())
-    }
-
-    fn set_hint(&mut self, active_hosts: &[usize], hint: Hint, arguments: &[String]) {
-        let Some(value) = hint.value(arguments) else {
-            return;
-        };
-        for index in active_hosts {
-            let hints = &mut self.hosts[*index].hints;
-            let slot = match hint {
-                Hint::Hostname => &mut hints.hostname,
-                Hint::User => &mut hints.user,
-            };
-            if slot.is_none() {
-                *slot = Some(value.clone());
-            }
-        }
-    }
-
-    fn set_port(
-        &mut self,
-        source: &Path,
-        line: usize,
-        active_hosts: &[usize],
-        arguments: &[String],
-    ) -> Result<(), CatalogError> {
-        let port = normalize_port(arguments).map_err(|message| CatalogError::Syntax {
-            path: source.to_path_buf(),
-            line,
-            message,
-        })?;
-        for index in active_hosts {
-            self.hosts[*index].hints.port.get_or_insert(port.clone());
-        }
         Ok(())
     }
 }
@@ -1095,16 +911,10 @@ enum FirstValue {
 }
 
 impl FirstValue {
-    fn set(&mut self, active: Truth, arguments: &[String], join: bool) {
-        if !matches!(self, Self::Unset) || arguments.is_empty() {
-            return;
+    fn set(&mut self, active: Truth, arguments: &[String]) {
+        if let Some(value) = arguments.first() {
+            self.set_value(active, value.clone());
         }
-        let value = if join {
-            arguments.join(" ")
-        } else {
-            arguments[0].clone()
-        };
-        self.set_value(active, value);
     }
 
     fn set_value(&mut self, active: Truth, value: String) {
@@ -1172,28 +982,26 @@ impl ProxyOptions {
             return;
         }
 
-        match active {
-            Truth::No => {}
-            Truth::Yes => {
-                self.jump = JumpState::Known {
-                    raw: raw.to_string(),
-                    host: host.to_string(),
-                };
-                if !host.is_empty() {
-                    self.command = FirstValue::Known("none".to_string());
-                }
+        if active == Truth::Yes {
+            self.jump = JumpState::Known {
+                raw: raw.to_string(),
+                host: host.to_string(),
+            };
+            if !host.is_empty() {
+                self.command = FirstValue::Known("none".to_string());
             }
-            Truth::Unknown => {
-                self.jump = JumpState::Unknown;
-                if !host.is_empty() {
-                    self.command = FirstValue::Unknown;
-                }
+        } else {
+            self.jump = JumpState::Unknown;
+            if !host.is_empty() {
+                self.command = FirstValue::Unknown;
             }
         }
     }
 
     fn set_command(&mut self, active: Truth, arguments: &[String]) {
-        self.command.set(active, arguments, true);
+        if !arguments.is_empty() {
+            self.command.set_value(active, arguments.join(" "));
+        }
     }
 
     fn jump_host(&self) -> Option<String> {
@@ -1406,19 +1214,7 @@ impl<'a> AliasValidator<'a> {
         active: &mut Truth,
         include_chain: &mut Vec<IncludeHop>,
     ) -> Result<(), CatalogError> {
-        if self.include_stack.len() > MAX_INCLUDE_DEPTH {
-            return Err(CatalogError::IncludeDepth {
-                path: path.to_path_buf(),
-                limit: MAX_INCLUDE_DEPTH,
-            });
-        }
-        let canonical = fs::canonicalize(path).map_err(|source| CatalogError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if !self.include_stack.insert(canonical.clone()) {
-            return Err(CatalogError::IncludeCycle { path: canonical });
-        }
+        let canonical = enter_include(&mut self.include_stack, path)?;
         let result =
             self.parse_file_contents(&canonical, is_include, can_activate, active, include_chain);
         self.include_stack.remove(&canonical);
@@ -1433,17 +1229,11 @@ impl<'a> AliasValidator<'a> {
         active: &mut Truth,
         include_chain: &mut Vec<IncludeHop>,
     ) -> Result<(), CatalogError> {
-        let contents = read_config_contents(path, is_include, self.context.local_uid_number)?;
+        let contents = read_config_contents(path, is_include, self.context.local_uid)?;
 
         for (line_index, raw_line) in contents.lines().enumerate() {
             let line = line_index + 1;
-            let Some(directive) =
-                parse_directive(raw_line).map_err(|message| CatalogError::Syntax {
-                    path: path.to_path_buf(),
-                    line,
-                    message,
-                })?
-            else {
+            let Some(directive) = parse_directive(raw_line).map_err(syntax(path, line))? else {
                 continue;
             };
 
@@ -1477,49 +1267,25 @@ impl<'a> AliasValidator<'a> {
                 "include" => {
                     self.parse_includes(path, line, &directive.arguments, active, include_chain)?;
                 }
-                "hostname" => self
-                    .options
-                    .hostname
-                    .set(*active, &directive.arguments, false),
-                "user" => self.options.user.set(*active, &directive.arguments, false),
+                "hostname" => self.options.hostname.set(*active, &directive.arguments),
+                "user" => self.options.user.set(*active, &directive.arguments),
                 "port" => {
-                    let port = normalize_port(&directive.arguments).map_err(|message| {
-                        CatalogError::Syntax {
-                            path: path.to_path_buf(),
-                            line,
-                            message,
-                        }
-                    })?;
+                    let port = normalize_port(&directive.arguments).map_err(syntax(path, line))?;
                     self.options.port.set_value(*active, port);
                 }
                 "canonicalizehostname" => {
-                    let value = normalize_canonicalize_hostname(&directive.arguments).map_err(
-                        |message| CatalogError::Syntax {
-                            path: path.to_path_buf(),
-                            line,
-                            message,
-                        },
-                    )?;
+                    let value = normalize_canonicalize_hostname(&directive.arguments)
+                        .map_err(syntax(path, line))?;
                     self.options.canonicalize_hostname.set_value(*active, value);
                 }
                 "canonicalizemaxdots" => {
-                    let value = normalize_canonicalize_max_dots(&directive.arguments).map_err(
-                        |message| CatalogError::Syntax {
-                            path: path.to_path_buf(),
-                            line,
-                            message,
-                        },
-                    )?;
+                    let value = normalize_canonicalize_max_dots(&directive.arguments)
+                        .map_err(syntax(path, line))?;
                     self.options.canonicalize_max_dots.set_value(*active, value);
                 }
                 "proxyjump" => {
                     if let Some(raw) = directive.arguments.first() {
-                        let host =
-                            normalize_proxy_jump(raw).map_err(|message| CatalogError::Syntax {
-                                path: path.to_path_buf(),
-                                line,
-                                message,
-                            })?;
+                        let host = normalize_proxy_jump(raw).map_err(syntax(path, line))?;
                         self.options.proxy.set_jump(*active, raw, &host);
                     }
                 }
@@ -1527,11 +1293,10 @@ impl<'a> AliasValidator<'a> {
                     .options
                     .proxy
                     .set_command(*active, &directive.arguments),
-                "hostkeyalias" => {
-                    self.options
-                        .host_key_alias
-                        .set(*active, &directive.arguments, false)
-                }
+                "hostkeyalias" => self
+                    .options
+                    .host_key_alias
+                    .set(*active, &directive.arguments),
                 _ => {}
             }
         }
@@ -1551,53 +1316,32 @@ impl<'a> AliasValidator<'a> {
             let target = self.include_target();
             let expanded = match self
                 .context
-                .expand_include_for_target(raw_pattern, Some(&target))
+                .expand_include(raw_pattern, Some(&target), false)
             {
                 Ok(expanded) => expanded,
                 Err(IncludeExpansionError::Ignored(_)) => continue,
                 Err(IncludeExpansionError::Fatal(message)) => {
-                    return Err(CatalogError::Syntax {
-                        path: source.to_path_buf(),
-                        line,
-                        message,
-                    });
+                    return Err(syntax(source, line)(message));
                 }
             };
-            if expanded.uncertain_target {
+            if expanded.tokens.uncertain_target {
                 if containing_active != Truth::No {
                     self.options.taint_unset();
                 }
                 continue;
             }
+            // libc glob, and therefore OpenSSH, treats malformed glob syntax
+            // as no match and ignores directory-iteration failures. A path the
+            // glob does return remains exact, so its later canonicalization or
+            // read failure is still fatal.
             let pattern = collapse_repeated_stars(&expanded.path.to_string_lossy());
-            let matches = match glob_with(
-                &pattern,
-                MatchOptions {
-                    case_sensitive: true,
-                    require_literal_separator: true,
-                    require_literal_leading_dot: true,
-                },
-            ) {
-                Ok(matches) => matches,
-                // libc glob, and therefore OpenSSH, treats malformed glob
-                // syntax as no match. This can happen only after a valid
-                // target token expands to a value containing a separator.
-                Err(_) => continue,
+            let Ok((mut paths, _)) = exact_include_matches(&pattern) else {
+                continue;
             };
-            let mut paths = Vec::new();
-            // OpenSSH ignores directory-iteration failures while expanding an
-            // Include glob. A path that the glob does return remains exact and
-            // its later canonicalization/read failure is still fatal.
-            for path in matches.flatten() {
-                paths.push(path);
-            }
             paths.sort();
             paths.dedup();
             for path in paths {
-                let included = fs::canonicalize(&path).map_err(|source| CatalogError::Read {
-                    path: path.clone(),
-                    source,
-                })?;
+                let included = fs::canonicalize(&path).map_err(read_error(&path))?;
                 include_chain.push(IncludeHop {
                     source: source.to_path_buf(),
                     line,
@@ -1718,18 +1462,26 @@ impl<'a> AliasValidator<'a> {
     }
 }
 
+/// How an Include pattern used connection-target tokens.
+#[derive(Clone, Copy, Default)]
+struct TokenUse {
+    /// A target token was expanded without a target, so `*` stands in.
+    unknown_target: bool,
+    /// A token may inherit its value from broader Host blocks and needs a
+    /// conservative fallback scan.
+    inherited_fallback: bool,
+    /// A target value was unknown because of stateful Match criteria.
+    uncertain_target: bool,
+}
+
 struct ExpandedInclude {
     path: PathBuf,
-    used_unknown_target: bool,
-    needs_inherited_fallback: bool,
-    uncertain_target: bool,
+    tokens: TokenUse,
 }
 
 struct ExpandedTokens {
     value: String,
-    used_unknown_target: bool,
-    needs_inherited_fallback: bool,
-    uncertain_target: bool,
+    tokens: TokenUse,
 }
 
 #[derive(Debug)]
@@ -1741,15 +1493,6 @@ enum IncludeExpansionError {
     Fatal(String),
 }
 
-impl std::fmt::Display for IncludeExpansionError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::Ignored(message) | Self::Fatal(message) => message,
-        };
-        formatter.write_str(message)
-    }
-}
-
 struct IncludeTarget {
     hostname: Option<String>,
     original_host: String,
@@ -1757,28 +1500,6 @@ struct IncludeTarget {
     port: Option<String>,
     jump_host: Option<String>,
     key_alias: Option<String>,
-}
-
-fn target_value(
-    target: Option<&IncludeTarget>,
-    value: impl FnOnce(&IncludeTarget) -> Option<&String>,
-    fallback: &str,
-    used_unknown_target: &mut bool,
-    uncertain_target: &mut bool,
-) -> String {
-    match target {
-        Some(target) => match value(target) {
-            Some(value) => value.clone(),
-            None => {
-                *uncertain_target = true;
-                "*".to_string()
-            }
-        },
-        None => {
-            *used_unknown_target = true;
-            fallback.to_string()
-        }
-    }
 }
 
 fn connection_hash(local_hostname: &str, target: &IncludeTarget) -> Option<String> {
@@ -1874,20 +1595,21 @@ fn normalize_numeric_host(host: &str) -> Option<String> {
         .map(|address| address.to_string())
 }
 
-fn normalize_port(arguments: &[String]) -> Result<String, String> {
-    let Some(value) = arguments.first() else {
-        return Err("Port requires a value".to_string());
-    };
+/// Parses the decimal spelling OpenSSH accepts: an optional `+` and digits.
+fn parse_decimal(value: &str) -> Option<u32> {
     let digits = value.strip_prefix('+').unwrap_or(value);
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("invalid Port {value:?}"));
-    }
-    let port = digits
-        .parse::<u32>()
-        .ok()
-        .filter(|port| (1..=u16::MAX.into()).contains(port))
-        .ok_or_else(|| format!("invalid Port {value:?}"))?;
-    Ok(port.to_string())
+    let numeric = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+    numeric.then(|| digits.parse().ok()).flatten()
+}
+
+fn normalize_port(arguments: &[String]) -> Result<String, String> {
+    let value = arguments
+        .first()
+        .ok_or_else(|| "Port requires a value".to_string())?;
+    parse_decimal(value)
+        .filter(|port| (1..=u32::from(u16::MAX)).contains(port))
+        .map(|port| port.to_string())
+        .ok_or_else(|| format!("invalid Port {value:?}"))
 }
 
 fn normalize_canonicalize_hostname(arguments: &[String]) -> Result<String, String> {
@@ -1903,19 +1625,13 @@ fn normalize_canonicalize_hostname(arguments: &[String]) -> Result<String, Strin
 }
 
 fn normalize_canonicalize_max_dots(arguments: &[String]) -> Result<String, String> {
-    let Some(value) = arguments.first() else {
-        return Err("CanonicalizeMaxDots requires a value".to_string());
-    };
-    let digits = value.strip_prefix('+').unwrap_or(value);
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("invalid CanonicalizeMaxDots {value:?}"));
-    }
-    let max_dots = digits
-        .parse::<u32>()
-        .ok()
-        .filter(|max_dots| *max_dots <= i32::MAX as u32)
-        .ok_or_else(|| format!("invalid CanonicalizeMaxDots {value:?}"))?;
-    Ok(max_dots.to_string())
+    let value = arguments
+        .first()
+        .ok_or_else(|| "CanonicalizeMaxDots requires a value".to_string())?;
+    parse_decimal(value)
+        .filter(|max_dots| i32::try_from(*max_dots).is_ok())
+        .map(|max_dots| max_dots.to_string())
+        .ok_or_else(|| format!("invalid CanonicalizeMaxDots {value:?}"))
 }
 
 fn normalize_proxy_jump(value: &str) -> Result<String, String> {
@@ -2025,6 +1741,25 @@ fn expand_environment(
     }
     expanded.push_str(remainder);
     Ok(expanded)
+}
+
+/// Expands an Include glob the way OpenSSH does: separators and leading dots
+/// must be literal. Directory-iteration failures are reported, not fatal.
+fn exact_include_matches(pattern: &str) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let options = MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: true,
+    };
+    let entries = glob_with(pattern, options).map_err(|error| error.to_string())?;
+    let (mut paths, mut warnings) = (Vec::new(), Vec::new());
+    for entry in entries {
+        match entry {
+            Ok(path) => paths.push(path),
+            Err(error) => warnings.push(error.to_string()),
+        }
+    }
+    Ok((paths, warnings))
 }
 
 fn collapse_repeated_stars(pattern: &str) -> String {
@@ -2197,60 +1932,21 @@ fn unicode_environment() -> HashMap<String, String> {
 
 #[cfg(unix)]
 fn current_account_identity() -> io::Result<AccountIdentity> {
-    use std::ffi::{CStr, OsString};
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStringExt;
-
     let uid = unsafe { libc::getuid() };
-    let mut capacity = passwd_buffer_size();
-    loop {
-        let mut entry = MaybeUninit::<libc::passwd>::uninit();
-        let mut result = std::ptr::null_mut();
-        let mut buffer = vec![0_u8; capacity];
-        let code = unsafe {
-            libc::getpwuid_r(
-                uid,
-                entry.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if code == libc::ERANGE && capacity < 1024 * 1024 {
-            capacity *= 2;
-            continue;
-        }
-        if code != 0 {
-            return Err(io::Error::from_raw_os_error(code));
-        }
-        if result.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no passwd entry for uid {uid}"),
-            ));
-        }
-
-        let entry = unsafe { entry.assume_init() };
-        if entry.pw_name.is_null() || entry.pw_dir.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "passwd entry has no username or home directory",
-            ));
-        }
-        let username = unsafe { CStr::from_ptr(entry.pw_name) }
-            .to_str()
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "passwd username is not UTF-8")
-            })?
-            .to_string();
-        let home = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes().to_vec();
-        return Ok(AccountIdentity {
-            username,
-            home: PathBuf::from(OsString::from_vec(home)),
-            uid: uid.to_string(),
-            uid_number: uid,
-        });
-    }
+    let (username, home) = passwd_entry(|entry, buffer, capacity, result| unsafe {
+        libc::getpwuid_r(uid, entry, buffer, capacity, result)
+    })?
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no passwd entry for uid {uid}"),
+        )
+    })?;
+    Ok(AccountIdentity {
+        username,
+        home,
+        uid,
+    })
 }
 
 #[cfg(not(unix))]
@@ -2266,8 +1962,7 @@ fn current_account_identity() -> io::Result<AccountIdentity> {
     Ok(AccountIdentity {
         username,
         home,
-        uid: "0".to_string(),
-        uid_number: 0,
+        uid: 0,
     })
 }
 
@@ -2292,27 +1987,34 @@ fn system_hostname() -> io::Result<String> {
 
 #[cfg(unix)]
 fn lookup_user_home(username: &str) -> io::Result<Option<PathBuf>> {
-    use std::ffi::{CStr, CString, OsString};
+    let name = CString::new(username)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "username contains NUL"))?;
+    let entry = passwd_entry(|entry, buffer, capacity, result| unsafe {
+        libc::getpwnam_r(name.as_ptr(), entry, buffer, capacity, result)
+    })?;
+    Ok(entry.map(|(_, home)| home))
+}
+
+/// Runs a reentrant passwd lookup with a buffer grown on `ERANGE`, returning
+/// the entry's username and home directory when one exists.
+#[cfg(unix)]
+fn passwd_entry(
+    lookup: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
+) -> io::Result<Option<(String, PathBuf)>> {
     use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStringExt;
 
-    let username = CString::new(username)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "username contains NUL"))?;
     let mut capacity = passwd_buffer_size();
-
     loop {
         let mut entry = MaybeUninit::<libc::passwd>::uninit();
         let mut result = std::ptr::null_mut();
         let mut buffer = vec![0_u8; capacity];
-        let code = unsafe {
-            libc::getpwnam_r(
-                username.as_ptr(),
-                entry.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
+        let code = lookup(
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        );
         if code == libc::ERANGE && capacity < 1024 * 1024 {
             capacity *= 2;
             continue;
@@ -2323,13 +2025,24 @@ fn lookup_user_home(username: &str) -> io::Result<Option<PathBuf>> {
         if result.is_null() {
             return Ok(None);
         }
-
         let entry = unsafe { entry.assume_init() };
-        if entry.pw_dir.is_null() {
-            return Ok(None);
+        if entry.pw_name.is_null() || entry.pw_dir.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "passwd entry has no username or home directory",
+            ));
         }
+        let username = unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_str()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "passwd username is not UTF-8")
+            })?
+            .to_string();
         let home = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes().to_vec();
-        return Ok(Some(PathBuf::from(OsString::from_vec(home))));
+        return Ok(Some((
+            username,
+            PathBuf::from(std::ffi::OsString::from_vec(home)),
+        )));
     }
 }
 
@@ -2346,18 +2059,6 @@ fn passwd_buffer_size() -> usize {
 #[cfg(not(unix))]
 fn lookup_user_home(_username: &str) -> io::Result<Option<PathBuf>> {
     Ok(None)
-}
-
-#[derive(Clone, Copy)]
-enum Hint {
-    Hostname,
-    User,
-}
-
-impl Hint {
-    fn value(self, arguments: &[String]) -> Option<String> {
-        arguments.first().cloned()
-    }
 }
 
 struct Directive {
@@ -2619,34 +2320,62 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    fn load_with_builder(config: &Path, mut builder: Builder) -> Catalog {
-        let mut active_hosts = Vec::new();
-        let mut has_unknown_host = false;
-        let mut include_chain = Vec::new();
-        builder
-            .parse_file(
-                config,
-                false,
-                &mut active_hosts,
-                &mut has_unknown_host,
-                &mut include_chain,
-            )
-            .unwrap();
-        builder.retain_reachable_hosts(config).unwrap();
-        Catalog {
-            config_path: config.to_path_buf(),
-            hosts: builder.hosts,
-            warnings: builder.warnings,
+    /// A temporary home directory whose `.ssh/config` is the root config.
+    struct Fixture(TempDir);
+
+    impl Fixture {
+        fn new() -> Self {
+            Self(TempDir::new().unwrap())
         }
+
+        fn home(&self) -> &Path {
+            self.0.path()
+        }
+
+        fn config(&self) -> PathBuf {
+            self.home().join(".ssh/config")
+        }
+
+        /// Writes a file at a path relative to the home directory.
+        fn write(&self, relative: impl AsRef<Path>, contents: &str) -> PathBuf {
+            let path = self.home().join(relative);
+            write(&path, contents);
+            path
+        }
+
+        fn builder(&self) -> Builder {
+            Builder::new(AccountIdentity::for_test(self.home().to_path_buf()))
+        }
+
+        fn load(&self) -> Result<Catalog, CatalogError> {
+            Catalog::load_with_home(&self.config(), self.home())
+        }
+
+        fn aliases(&self) -> Vec<String> {
+            aliases(&self.load().unwrap())
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn aliases(catalog: &Catalog) -> Vec<&str> {
+        catalog
+            .hosts()
+            .iter()
+            .map(|host| host.alias.as_str())
+            .collect()
+    }
+
+    fn load_with_builder(config: &Path, builder: Builder) -> Catalog {
+        builder.into_catalog(config, config).unwrap()
     }
 
     #[test]
     fn discovers_concrete_hosts_with_hints_in_declaration_order() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             r#"
 Host *
   ServerAliveInterval 30
@@ -2662,12 +2391,8 @@ Host staging
 "#,
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
         assert_eq!(aliases, ["prod", "prod-alt", "staging"]);
         assert_eq!(
             catalog.hosts()[0].hints,
@@ -2683,23 +2408,18 @@ Host staging
 
     #[test]
     fn follows_includes_in_lexical_order() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let ssh_dir = home.join(".ssh");
-        let config = ssh_dir.join("config");
-        write(
-            &config,
+        fixture.write(
+            ".ssh/config",
             "Include conf.d/*.conf\nHost root\n  User root-user\nHost after\n",
         );
         write(&ssh_dir.join("conf.d/b.conf"), "Host beta\n");
         write(&ssh_dir.join("conf.d/a.conf"), "Host alpha\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
         assert_eq!(aliases, ["alpha", "beta", "root", "after"]);
         assert_eq!(catalog.hosts()[2].hints.user.as_deref(), Some("root-user"));
         assert_eq!(catalog.hosts()[1].hints.user, None);
@@ -2708,17 +2428,17 @@ Host staging
 
     #[test]
     fn rejects_reachable_include_cycles() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let ssh_dir = home.join(".ssh");
         let config = ssh_dir.join("config");
-        write(&config, "Include conf.d/cycle.conf\nHost root\n");
+        fixture.write(".ssh/config", "Include conf.d/cycle.conf\nHost root\n");
         write(
             &ssh_dir.join("conf.d/cycle.conf"),
             "Host included\nInclude config\n",
         );
 
-        let error = Catalog::load_with_home(&config, home).unwrap_err();
+        let error = fixture.load().unwrap_err();
         match error {
             CatalogError::IncludeCycle { path } => {
                 assert_eq!(path, fs::canonicalize(config).unwrap());
@@ -2753,11 +2473,7 @@ Host staging
             .user_homes
             .insert("fixture-user".to_string(), other_home);
         let catalog = load_with_builder(&config, builder);
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["environment", "home-token", "other-user", "root"]);
         assert!(catalog.warnings().is_empty());
@@ -2779,8 +2495,7 @@ Host staging
         let mut builder = Builder::new(AccountIdentity {
             username: "passwd-user".to_string(),
             home: account_home,
-            uid: "4242".to_string(),
-            uid_number: test_uid(),
+            uid: test_uid(),
         });
         builder
             .environment
@@ -2790,26 +2505,21 @@ Host staging
             temp.path().join("environment-home").display().to_string(),
         );
         let catalog = load_with_builder(&config, builder);
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["relative", "home-token", "current-user"]);
     }
 
     #[test]
     fn missing_include_environment_variable_is_ignored_with_a_warning() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        let config = fixture.config();
+        fixture.write(
+            ".ssh/config",
             "Include ${PORTEIRO_TEST_MISSING}/config\nHost retained\n",
         );
 
-        let mut builder = Builder::new(AccountIdentity::for_test(home.to_path_buf()));
+        let mut builder = fixture.builder();
         builder.environment.remove("PORTEIRO_TEST_MISSING");
         let catalog = load_with_builder(&config, builder);
 
@@ -2825,22 +2535,18 @@ Host staging
 
     #[test]
     fn rejects_include_nesting_beyond_the_openssh_limit() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Include nested/0.conf\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Include nested/0.conf\n");
         for depth in 0..17 {
             let contents = if depth == 16 {
                 "Host unreachable\n".to_string()
             } else {
                 format!("Include nested/{}.conf\n", depth + 1)
             };
-            write(&home.join(format!(".ssh/nested/{depth}.conf")), &contents);
+            fixture.write(format!(".ssh/nested/{depth}.conf"), &contents);
         }
 
-        let error = Catalog::load_with_home(&config, home)
-            .unwrap_err()
-            .to_string();
+        let error = fixture.load().unwrap_err().to_string();
 
         assert!(error.contains("too many recursive"));
         assert!(error.contains("maximum depth: 16"));
@@ -2858,16 +2564,20 @@ Host staging
                 hostname: Some("host-%h".to_string()),
                 user: Some("remote-user".to_string()),
                 port: Some("2200".to_string()),
-                proxy_jump: Some("jump".to_string()),
-                proxy_command: None,
+                ..HostHints::default()
             },
         });
+        builder.update_proxy(&[0], |proxy| proxy.set_jump(Truth::Yes, "jump", "jump"));
         builder.host_key_aliases.insert(0, "key-alias".to_string());
         let target = builder.include_target(0);
         let hash = connection_hash(&builder.local_hostname, &target).unwrap();
 
         let expanded = builder
-            .expand_include_tokens("%%/%C/%d/%h/%i/%j/%k/%L/%l/%n/%p/%r/%u", Some(&target))
+            .expand_include_tokens(
+                "%%/%C/%d/%h/%i/%j/%k/%L/%l/%n/%p/%r/%u",
+                Some(&target),
+                false,
+            )
             .unwrap();
         let expected = format!(
             "%/{hash}/{}/{}/{}/jump/key-alias/{}/{}/original/2200/remote-user/{}",
@@ -2883,30 +2593,21 @@ Host staging
             builder.local_username,
         );
         assert_eq!(expanded.value, expected);
-        assert!(!expanded.used_unknown_target);
-        assert!(expanded.needs_inherited_fallback);
+        assert!(!expanded.tokens.unknown_target);
+        assert!(expanded.tokens.inherited_fallback);
     }
 
     #[test]
     fn conservatively_discovers_includes_using_inherited_target_values() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host *\n  HostName inherited-target\n  Include inherited/%h\n",
         );
-        write(
-            &home.join(".ssh/inherited/inherited-target"),
-            "Host inherited-alias\n",
-        );
+        fixture.write(".ssh/inherited/inherited-target", "Host inherited-alias\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["inherited-alias"]);
         assert_eq!(
@@ -2920,19 +2621,13 @@ Host staging
 
     #[test]
     fn original_host_token_does_not_scan_sibling_files() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host *\n  Include exact/%n.conf\n");
-        write(&home.join(".ssh/exact/expected.conf"), "Host expected\n");
-        write(&home.join(".ssh/exact/unrelated.conf"), "Host spurious\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  Include exact/%n.conf\n");
+        fixture.write(".ssh/exact/expected.conf", "Host expected\n");
+        fixture.write(".ssh/exact/unrelated.conf", "Host spurious\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["expected"]);
         assert_eq!(catalog.warnings().len(), 1);
@@ -2940,21 +2635,15 @@ Host staging
 
     #[test]
     fn mixed_concrete_and_wildcard_hosts_keep_an_unknown_include_context() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host seed *\n  Include by/%n.conf\n");
-        write(
-            &home.join(".ssh/by/hidden.conf"),
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host seed *\n  Include by/%n.conf\n");
+        fixture.write(
+            ".ssh/by/hidden.conf",
             "Host hidden\n  HostName valid.example\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["seed", "hidden"]);
         assert_eq!(
@@ -2965,43 +2654,33 @@ Host staging
 
     #[test]
     fn conservative_target_scans_cross_separators_and_leading_dots() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host *\n  Include by/%n.conf\n");
-        write(
-            &home.join(".ssh/by/team/prod.conf"),
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  Include by/%n.conf\n");
+        fixture.write(
+            ".ssh/by/team/prod.conf",
             "Host team/prod\n  HostName valid.example\n",
         );
-        write(
-            &home.join(".ssh/by/.hidden.conf"),
+        fixture.write(
+            ".ssh/by/.hidden.conf",
             "Host .hidden\n  HostName hidden.example\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, [".hidden", "team/prod"]);
+        assert_eq!(fixture.aliases(), [".hidden", "team/prod"]);
     }
 
     #[test]
     fn conservative_target_scans_follow_parent_components_within_the_config_tree() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let ssh_dir = home.join(".ssh");
-        let config = ssh_dir.join("config");
-        write(&config, "Host *\n  Include by/%n.conf\n");
+        fixture.write(".ssh/config", "Host *\n  Include by/%n.conf\n");
         fs::create_dir_all(ssh_dir.join("by")).unwrap();
         write(
             &ssh_dir.join("outside.conf"),
             "Host ../outside\n  HostName outside.example\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
 
         assert_eq!(catalog.hosts().len(), 1);
         assert_eq!(catalog.hosts()[0].alias, "../outside");
@@ -3013,25 +2692,16 @@ Host staging
 
     #[test]
     fn unknown_target_tokens_are_not_captured_by_glob_character_classes() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host *\n  Include classes/[%n].conf\n");
-        write(
-            &home.join(".ssh/classes/a.conf"),
-            "Host a\n  HostName a.example\n",
-        );
-        write(
-            &home.join(".ssh/classes/z.conf"),
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  Include classes/[%n].conf\n");
+        fixture.write(".ssh/classes/a.conf", "Host a\n  HostName a.example\n");
+        fixture.write(
+            ".ssh/classes/z.conf",
             "Host spurious\n  HostName wrong.example\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["a"]);
         assert_eq!(
@@ -3042,52 +2712,41 @@ Host staging
 
     #[test]
     fn multiple_target_dependent_includes_share_their_host_context() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host seed *\n  Include by/%n.conf\n  Include classes/[%n].conf\n",
         );
-        write(
-            &home.join(".ssh/by/hidden.conf"),
+        fixture.write(
+            ".ssh/by/hidden.conf",
             "Host hidden\n  HostName valid.example\n",
         );
-        write(
-            &home.join(".ssh/by/.hidden.conf"),
+        fixture.write(
+            ".ssh/by/.hidden.conf",
             "Host .hidden\n  HostName hidden.example\n",
         );
-        write(
-            &home.join(".ssh/by/team/prod.conf"),
+        fixture.write(
+            ".ssh/by/team/prod.conf",
             "Host team/prod\n  HostName team.example\n",
         );
-        write(
-            &home.join(".ssh/classes/a.conf"),
-            "Host a\n  HostName a.example\n",
-        );
-        write(
-            &home.join(".ssh/classes/z.conf"),
+        fixture.write(".ssh/classes/a.conf", "Host a\n  HostName a.example\n");
+        fixture.write(
+            ".ssh/classes/z.conf",
             "Host spurious\n  HostName wrong.example\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["seed", ".hidden", "hidden", "team/prod", "a"]);
+        assert_eq!(
+            fixture.aliases(),
+            ["seed", ".hidden", "hidden", "team/prod", "a"]
+        );
     }
 
     #[test]
     fn malformed_include_globs_are_ignored_like_openssh() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Include broken/[\nHost kept\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Include broken/[\nHost kept\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
 
         assert_eq!(catalog.hosts().len(), 1);
         assert_eq!(catalog.hosts()[0].alias, "kept");
@@ -3103,17 +2762,13 @@ Host staging
             ("invalid-%x.conf", "unsupported"),
             ("invalid-%", "trailing"),
         ] {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path();
-            let config = home.join(".ssh/config");
-            write(
-                &config,
+            let fixture = Fixture::new();
+            fixture.write(
+                ".ssh/config",
                 &format!("Host prod\n  Include {pattern}\n  HostName prod.example\n"),
             );
 
-            let error = Catalog::load_with_home(&config, home)
-                .unwrap_err()
-                .to_string();
+            let error = fixture.load().unwrap_err().to_string();
 
             assert!(error.contains(expected), "unexpected error: {error}");
             assert!(error.contains(":2:"), "unexpected error: {error}");
@@ -3125,11 +2780,10 @@ Host staging
     fn conservative_scans_preserve_lexical_symlink_paths() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let by = home.join(".ssh/by");
-        write(&config, "Host *\n  Include by/%n/fixed/hosts.conf\n");
+        fixture.write(".ssh/config", "Host *\n  Include by/%n/fixed/hosts.conf\n");
         write(
             &by.join("a-real/hosts.conf"),
             "Host z-team\n  HostName team.example\n",
@@ -3137,7 +2791,7 @@ Host staging
         fs::create_dir_all(by.join("z-team")).unwrap();
         symlink("../a-real", by.join("z-team/fixed")).unwrap();
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
         assert_eq!(catalog.hosts().len(), 1);
         assert_eq!(catalog.hosts()[0].alias, "z-team");
         assert_eq!(
@@ -3148,74 +2802,37 @@ Host staging
 
     #[test]
     fn exact_include_globs_do_not_cross_separators_or_leading_dots() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Include exact/*.conf\n");
-        write(&home.join(".ssh/exact/top.conf"), "Host top\n");
-        write(&home.join(".ssh/exact/nested/deep.conf"), "Host nested\n");
-        write(&home.join(".ssh/exact/.hidden.conf"), "Host hidden\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Include exact/*.conf\n");
+        fixture.write(".ssh/exact/top.conf", "Host top\n");
+        fixture.write(".ssh/exact/nested/deep.conf", "Host nested\n");
+        fixture.write(".ssh/exact/.hidden.conf", "Host hidden\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["top"]);
+        assert_eq!(fixture.aliases(), ["top"]);
     }
 
     #[test]
     fn conditional_includes_do_not_register_unreachable_aliases() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host root\n  Include conditional.conf\nMatch originalhost never\n  Include match.conf\nHost kept\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host root\n  Include conditional.conf\nMatch originalhost never\n  Include match.conf\nHost kept\n",
         );
-        write(
-            &home.join(".ssh/conditional.conf"),
-            "Host unreachable-host\n",
-        );
-        write(&home.join(".ssh/match.conf"), "Host unreachable-match\n");
+        fixture.write(".ssh/conditional.conf", "Host unreachable-host\n");
+        fixture.write(".ssh/match.conf", "Host unreachable-match\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["root", "kept"]);
+        assert_eq!(fixture.aliases(), ["root", "kept"]);
     }
 
     #[test]
     fn host_and_user_conditions_are_case_sensitive_but_hostname_matches_are_not() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host foo*\n  Include wrong-host.conf\nMatch user TESTER\n  Include wrong-user.conf\nMatch localuser TESTER\n  Include wrong-local-user.conf\nHost *\n  HostName PROD-TARGET\nMatch host prod-target\n  Include matched-host.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host foo*\n  Include wrong-host.conf\nMatch user TESTER\n  Include wrong-user.conf\nMatch localuser TESTER\n  Include wrong-local-user.conf\nHost *\n  HostName PROD-TARGET\nMatch host prod-target\n  Include matched-host.conf\n",
         );
-        write(&home.join(".ssh/wrong-host.conf"), "Host FooIncluded\n");
-        write(&home.join(".ssh/wrong-user.conf"), "Host wrong-user\n");
-        write(
-            &home.join(".ssh/wrong-local-user.conf"),
-            "Host wrong-local-user\n",
-        );
-        write(&home.join(".ssh/matched-host.conf"), "Host matched\n");
+        fixture.write(".ssh/wrong-host.conf", "Host FooIncluded\n");
+        fixture.write(".ssh/wrong-user.conf", "Host wrong-user\n");
+        fixture.write(".ssh/wrong-local-user.conf", "Host wrong-local-user\n");
+        fixture.write(".ssh/matched-host.conf", "Host matched\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["matched"]);
+        assert_eq!(fixture.aliases(), ["matched"]);
     }
 
     #[test]
@@ -3253,11 +2870,10 @@ Host staging
                 fallback_path: "dynamic/victim.conf",
             },
         ] {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path();
-            let config = home.join(".ssh/config");
-            write(
-                &config,
+            let fixture = Fixture::new();
+            let home = fixture.home();
+            fixture.write(
+                ".ssh/config",
                 &format!(
                     "Match exec \"true\"\n  {}\nHost *\n  Include {}\n",
                     case.directive, case.include
@@ -3265,7 +2881,7 @@ Host staging
             );
             write(&home.join(".ssh").join(case.fallback_path), "Host victim\n");
 
-            let catalog = Catalog::load_with_home(&config, home).unwrap();
+            let catalog = fixture.load().unwrap();
             assert!(
                 catalog.hosts().is_empty(),
                 "dynamic directive unexpectedly authorized an Include: {}",
@@ -3276,10 +2892,8 @@ Host staging
 
     #[test]
     fn dynamic_match_taints_connection_hash_includes() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        let builder = Builder::new(AccountIdentity::for_test(home.to_path_buf()));
+        let fixture = Fixture::new();
+        let builder = fixture.builder();
         let target = IncludeTarget {
             hostname: Some("victim".to_string()),
             original_host: "victim".to_string(),
@@ -3289,17 +2903,16 @@ Host staging
             key_alias: Some("victim".to_string()),
         };
         let fallback_hash = connection_hash(&builder.local_hostname, &target).unwrap();
-        write(
-            &config,
+        fixture.write(
+            ".ssh/config",
             "Match exec \"true\"\n  HostName dynamic-host\nHost *\n  Include dynamic/%C.conf\n",
         );
-        write(
-            &home.join(format!(".ssh/dynamic/{fallback_hash}.conf")),
+        fixture.write(
+            format!(".ssh/dynamic/{fallback_hash}.conf"),
             "Host victim\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert!(catalog.hosts().is_empty());
+        assert!(fixture.aliases().is_empty());
     }
 
     #[test]
@@ -3338,11 +2951,10 @@ Host staging
                     fallback_path: "dynamic/victim.conf",
                 },
             ] {
-                let temp = TempDir::new().unwrap();
-                let home = temp.path();
-                let config = home.join(".ssh/config");
-                write(
-                    &config,
+                let fixture = Fixture::new();
+                let home = fixture.home();
+                fixture.write(
+                    ".ssh/config",
                     &format!(
                         "Match {criterion}\n  {}\nHost *\n  Include {}\n",
                         case.directive, case.include
@@ -3350,7 +2962,7 @@ Host staging
                 );
                 write(&home.join(".ssh").join(case.fallback_path), "Host victim\n");
 
-                let catalog = Catalog::load_with_home(&config, home).unwrap();
+                let catalog = fixture.load().unwrap();
                 assert!(
                     catalog.hosts().is_empty(),
                     "{criterion:?} unexpectedly authorized an Include after {}",
@@ -3362,165 +2974,104 @@ Host staging
 
     #[test]
     fn final_pass_matches_host_blocks_against_the_effective_lowercase_host() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host *\n  HostName TARGET.EXAMPLE\nMatch final\n  Include final.conf\n",
         );
-        write(
-            &home.join(".ssh/final.conf"),
-            "Host prod\nHost target.example\n",
-        );
+        fixture.write(".ssh/final.conf", "Host prod\nHost target.example\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["target.example"]);
+        assert_eq!(fixture.aliases(), ["target.example"]);
     }
 
     #[test]
     fn canonical_matches_during_a_final_pass_requested_by_match_final() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Match final\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(&home.join(".ssh/canonical.conf"), "Host prod\n");
+        fixture.write(".ssh/canonical.conf", "Host prod\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert_eq!(catalog.hosts().len(), 1);
-        assert_eq!(catalog.hosts()[0].alias, "prod");
+        assert_eq!(fixture.aliases(), ["prod"]);
     }
 
     #[test]
     fn canonicalize_hostname_requests_a_deterministic_final_pass_for_ip_aliases() {
         for setting in ["yes", "true", "always"] {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path();
-            let config = home.join(".ssh/config");
-            write(
-                &config,
-                &format!(
+            let fixture = Fixture::new();
+            fixture.write(".ssh/config", &format!(
                     "Host *\n  CanonicalizeHostname {setting}\nMatch canonical\n  Include canonical.conf\n"
                 ),
             );
-            write(&home.join(".ssh/canonical.conf"), "Host 192.0.2.1\n");
+            fixture.write(".ssh/canonical.conf", "Host 192.0.2.1\n");
 
-            let catalog = Catalog::load_with_home(&config, home).unwrap();
-            assert_eq!(catalog.hosts().len(), 1, "setting {setting:?}");
-            assert_eq!(catalog.hosts()[0].alias, "192.0.2.1");
+            assert_eq!(fixture.aliases(), ["192.0.2.1"], "setting {setting:?}");
         }
     }
 
     #[test]
     fn canonicalization_that_can_use_dns_does_not_authorize_final_host_blocks() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host *\n  CanonicalizeHostname always\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(&home.join(".ssh/canonical.conf"), "Host prod\n");
+        fixture.write(".ssh/canonical.conf", "Host prod\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert!(catalog.hosts().is_empty());
+        assert!(fixture.aliases().is_empty());
     }
 
     #[test]
     fn canonicalize_max_dots_allows_a_dns_free_final_pass_above_the_default_limit() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  HostName PROD.EXAMPLE.TEST\n  CanonicalizeHostname yes\nMatch canonical\n  Include canonical.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  HostName PROD.EXAMPLE.TEST\n  CanonicalizeHostname yes\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(
-            &home.join(".ssh/canonical.conf"),
-            "Host prod.example.test\n",
-        );
+        fixture.write(".ssh/canonical.conf", "Host prod.example.test\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert_eq!(catalog.hosts().len(), 1);
-        assert_eq!(catalog.hosts()[0].alias, "prod.example.test");
+        assert_eq!(fixture.aliases(), ["prod.example.test"]);
     }
 
     #[test]
     fn canonicalize_max_dots_keeps_names_at_the_limit_dns_dependent() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  HostName prod.example.test\n  CanonicalizeHostname yes\n  CanonicalizeMaxDots 2\n  CanonicalDomains example.invalid\nMatch canonical\n  Include canonical.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  HostName prod.example.test\n  CanonicalizeHostname yes\n  CanonicalizeMaxDots 2\n  CanonicalDomains example.invalid\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(
-            &home.join(".ssh/canonical.conf"),
-            "Host prod.example.test\n",
-        );
+        fixture.write(".ssh/canonical.conf", "Host prod.example.test\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert!(catalog.hosts().is_empty());
+        assert!(fixture.aliases().is_empty());
     }
 
     #[test]
     fn canonicalize_max_dots_uses_the_first_obtained_value() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  HostName prod.example.test\n  CanonicalizeHostname yes\n  CanonicalizeMaxDots 1\n  CanonicalizeMaxDots 2\nMatch canonical\n  Include canonical.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  HostName prod.example.test\n  CanonicalizeHostname yes\n  CanonicalizeMaxDots 1\n  CanonicalizeMaxDots 2\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(
-            &home.join(".ssh/canonical.conf"),
-            "Host prod.example.test\n",
-        );
+        fixture.write(".ssh/canonical.conf", "Host prod.example.test\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert_eq!(catalog.hosts().len(), 1);
-        assert_eq!(catalog.hosts()[0].alias, "prod.example.test");
+        assert_eq!(fixture.aliases(), ["prod.example.test"]);
     }
 
     #[test]
     fn an_unknown_canonicalize_max_dots_does_not_assume_dns_is_skipped() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  HostName prod.example.test\n  CanonicalizeHostname yes\nMatch exec true\n  CanonicalizeMaxDots 1\nMatch canonical\n  Include canonical.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  HostName prod.example.test\n  CanonicalizeHostname yes\nMatch exec true\n  CanonicalizeMaxDots 1\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(
-            &home.join(".ssh/canonical.conf"),
-            "Host prod.example.test\n",
-        );
+        fixture.write(".ssh/canonical.conf", "Host prod.example.test\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert!(catalog.hosts().is_empty());
+        assert!(fixture.aliases().is_empty());
     }
 
     #[test]
     fn invalid_canonicalize_max_dots_is_rejected() {
         for value in ["-1", "2147483648", "many"] {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path();
-            let config = home.join(".ssh/config");
-            write(
-                &config,
+            let fixture = Fixture::new();
+            fixture.write(
+                ".ssh/config",
                 &format!("CanonicalizeMaxDots {value}\nHost prod\n"),
             );
 
-            let error = Catalog::load_with_home(&config, home).unwrap_err();
+            let error = fixture.load().unwrap_err();
             assert!(
                 error.to_string().contains("invalid CanonicalizeMaxDots"),
                 "value {value:?}: {error}"
@@ -3531,76 +3082,51 @@ Host staging
     #[test]
     fn canonicalize_yes_preserves_a_known_proxied_hostname_for_the_final_pass() {
         for proxy in ["ProxyJump jump.example", "ProxyCommand nc proxy 22"] {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path();
-            let config = home.join(".ssh/config");
-            write(
-                &config,
-                &format!(
+            let fixture = Fixture::new();
+            fixture.write(".ssh/config", &format!(
                     "Host *\n  CanonicalizeHostname yes\n  {proxy}\nMatch canonical\n  Include canonical.conf\n"
                 ),
             );
-            write(&home.join(".ssh/canonical.conf"), "Host prod\n");
+            fixture.write(".ssh/canonical.conf", "Host prod\n");
 
-            let catalog = Catalog::load_with_home(&config, home).unwrap();
-            assert_eq!(catalog.hosts().len(), 1, "proxy {proxy:?}");
-            assert_eq!(catalog.hosts()[0].alias, "prod");
+            assert_eq!(fixture.aliases(), ["prod"], "proxy {proxy:?}");
         }
     }
 
     #[test]
     fn canonicalize_always_keeps_proxied_dns_names_unknown() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  CanonicalizeHostname always\n  ProxyJump jump.example\nMatch canonical\n  Include canonical.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  CanonicalizeHostname always\n  ProxyJump jump.example\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(&home.join(".ssh/canonical.conf"), "Host prod\n");
+        fixture.write(".ssh/canonical.conf", "Host prod\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert!(catalog.hosts().is_empty());
+        assert!(fixture.aliases().is_empty());
     }
 
     #[test]
     fn canonical_final_pass_uses_the_canonical_textual_ip_address() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host *\n  CanonicalizeHostname yes\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(
-            &home.join(".ssh/canonical.conf"),
+        fixture.write(
+            ".ssh/canonical.conf",
             "Host 2001:0DB8:0:0::1\nHost 2001:db8::1\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-        assert_eq!(aliases, ["2001:db8::1"]);
+        assert_eq!(fixture.aliases(), ["2001:db8::1"]);
     }
 
     #[cfg(unix)]
     #[test]
     fn canonical_final_pass_normalizes_legacy_numeric_addresses_without_dns() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  HostName 192.000.002.001\n  CanonicalizeHostname yes\nMatch canonical\n  Include canonical.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  HostName 192.000.002.001\n  CanonicalizeHostname yes\nMatch canonical\n  Include canonical.conf\n",
         );
-        write(&home.join(".ssh/canonical.conf"), "Host 192.0.2.1\n");
+        fixture.write(".ssh/canonical.conf", "Host 192.0.2.1\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert_eq!(catalog.hosts().len(), 1);
-        assert_eq!(catalog.hosts()[0].alias, "192.0.2.1");
+        assert_eq!(fixture.aliases(), ["192.0.2.1"]);
         assert_eq!(
             normalize_numeric_host("192.000.002.001").as_deref(),
             Some("192.0.2.1")
@@ -3611,13 +3137,12 @@ Host staging
 
     #[test]
     fn reachable_declaration_replaces_unreachable_candidate_hints_and_source() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let conditional = home.join(".ssh/conditional.conf");
         let global = home.join(".ssh/global.conf");
-        write(
-            &config,
+        fixture.write(
+            ".ssh/config",
             "Host gate\n  Include conditional.conf\nHost *\n  Include global.conf\n",
         );
         write(
@@ -3626,7 +3151,7 @@ Host staging
         );
         write(&global, "Host duplicate\n  HostName reachable.example\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
         let duplicate = catalog
             .hosts()
             .iter()
@@ -3642,24 +3167,16 @@ Host staging
 
     #[test]
     fn reachable_duplicate_uses_its_actual_traversal_position() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let shared = home.join(".ssh/shared.conf");
-        write(
-            &config,
+        fixture.write(
+            ".ssh/config",
             "Host gate\n  Include shared.conf\nHost middle\nHost *\n  Include shared.conf\n",
         );
         write(&shared, "Host duplicate\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["gate", "middle", "duplicate"]);
+        assert_eq!(fixture.aliases(), ["gate", "middle", "duplicate"]);
     }
 
     #[cfg(unix)]
@@ -3667,16 +3184,16 @@ Host staging
     fn rejects_group_or_world_writable_included_files_but_not_the_root() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
+        let fixture = Fixture::new();
+        let home = fixture.home();
+        let config = fixture.config();
         let included = home.join(".ssh/unsafe.conf");
-        write(&config, "Include unsafe.conf\n");
+        fixture.write(".ssh/config", "Include unsafe.conf\n");
         write(&included, "Host unsafe\n");
         fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
         fs::set_permissions(&included, fs::Permissions::from_mode(0o666)).unwrap();
 
-        let error = Catalog::load_with_home(&config, home).unwrap_err();
+        let error = fixture.load().unwrap_err();
         match error {
             CatalogError::UnsafeInclude { path, mode, .. } => {
                 assert_eq!(path, fs::canonicalize(included).unwrap());
@@ -3709,18 +3226,14 @@ Host staging
 
     #[test]
     fn normalized_and_empty_jump_tokens_reach_their_includes() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        let home = fixture.home();
+        fixture.write(
+            ".ssh/config",
             "Host *\n  ProxyJump alice@jump.example:2222\n  Include jump/%j.conf\n",
         );
-        write(
-            &home.join(".ssh/jump/jump.example.conf"),
-            "Host normalized\n",
-        );
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        fixture.write(".ssh/jump/jump.example.conf", "Host normalized\n");
+        let catalog = fixture.load().unwrap();
         assert_eq!(
             catalog.hosts().first().map(|host| host.alias.as_str()),
             Some("normalized"),
@@ -3733,7 +3246,7 @@ Host staging
             &empty_config,
             "Host *\n  Include jump-empty/%j/hosts.conf\n",
         );
-        write(&home.join(".ssh/jump-empty/hosts.conf"), "Host no-jump\n");
+        fixture.write(".ssh/jump-empty/hosts.conf", "Host no-jump\n");
         let catalog = Catalog::load_with_home(&empty_config, home).unwrap();
         assert_eq!(
             catalog.hosts().first().map(|host| host.alias.as_str()),
@@ -3745,19 +3258,12 @@ Host staging
 
     #[test]
     fn proxy_command_precedence_keeps_jump_token_empty() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host *\n  ProxyCommand nc proxy 22\n  ProxyJump ignored.example\n  Include command-first/%j/hosts.conf\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host *\n  ProxyCommand nc proxy 22\n  ProxyJump ignored.example\n  Include command-first/%j/hosts.conf\n",
         );
-        write(
-            &home.join(".ssh/command-first/hosts.conf"),
-            "Host command-first\n",
-        );
+        fixture.write(".ssh/command-first/hosts.conf", "Host command-first\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
         assert_eq!(
             catalog.hosts().first().map(|host| host.alias.as_str()),
             Some("command-first"),
@@ -3773,10 +3279,8 @@ Host staging
 
     #[test]
     fn connection_hash_uses_the_normalized_jump_host() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        let builder = Builder::new(AccountIdentity::for_test(home.to_path_buf()));
+        let fixture = Fixture::new();
+        let builder = fixture.builder();
         let target = IncludeTarget {
             hostname: Some("hashed".to_string()),
             original_host: "hashed".to_string(),
@@ -3786,36 +3290,31 @@ Host staging
             key_alias: Some("hashed".to_string()),
         };
         let hash = connection_hash(&builder.local_hostname, &target).unwrap();
-        write(
-            &config,
+        fixture.write(
+            ".ssh/config",
             "Host *\n  ProxyJump alice@jump.example:2222\n  Include hashes/%C.conf\n",
         );
-        write(
-            &home.join(format!(".ssh/hashes/{hash}.conf")),
-            "Host hashed\n",
-        );
+        fixture.write(format!(".ssh/hashes/{hash}.conf"), "Host hashed\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
         assert_eq!(catalog.hosts()[0].alias, "hashed");
     }
 
     #[test]
     fn port_tokens_use_canonical_decimal_values() {
         for raw_port in ["0022", "+22"] {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path();
-            let config = home.join(".ssh/config");
-            write(
-                &config,
+            let fixture = Fixture::new();
+            fixture.write(
+                ".ssh/config",
                 &format!("Host *\n  Port {raw_port}\n  Include by-port/%p.conf\n"),
             );
-            write(&home.join(".ssh/by-port/22.conf"), "Host normalized\n");
-            write(
-                &home.join(format!(".ssh/by-port/{raw_port}.conf")),
+            fixture.write(".ssh/by-port/22.conf", "Host normalized\n");
+            fixture.write(
+                format!(".ssh/by-port/{raw_port}.conf"),
                 "Host raw-spelling\n",
             );
 
-            let catalog = Catalog::load_with_home(&config, home).unwrap();
+            let catalog = fixture.load().unwrap();
             assert_eq!(catalog.hosts().len(), 1, "raw port {raw_port:?}");
             assert_eq!(catalog.hosts()[0].alias, "normalized");
             assert_eq!(catalog.hosts()[0].hints.port.as_deref(), Some("22"));
@@ -3824,10 +3323,8 @@ Host staging
 
     #[test]
     fn connection_hash_uses_the_canonical_decimal_port() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        let builder = Builder::new(AccountIdentity::for_test(home.to_path_buf()));
+        let fixture = Fixture::new();
+        let builder = fixture.builder();
         let mut target = IncludeTarget {
             hostname: Some("hashed-port".to_string()),
             original_host: "hashed-port".to_string(),
@@ -3840,50 +3337,39 @@ Host staging
         target.port = Some("0022".to_string());
         let raw_hash = connection_hash(&builder.local_hostname, &target).unwrap();
         assert_ne!(canonical_hash, raw_hash);
-        write(&config, "Host *\n  Port 0022\n  Include hashes/%C.conf\n");
-        write(
-            &home.join(format!(".ssh/hashes/{canonical_hash}.conf")),
+        fixture.write(
+            ".ssh/config",
+            "Host *\n  Port 0022\n  Include hashes/%C.conf\n",
+        );
+        fixture.write(
+            format!(".ssh/hashes/{canonical_hash}.conf"),
             "Host hashed-port\n",
         );
-        write(
-            &home.join(format!(".ssh/hashes/{raw_hash}.conf")),
-            "Host raw-hash\n",
-        );
+        fixture.write(format!(".ssh/hashes/{raw_hash}.conf"), "Host raw-hash\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert_eq!(catalog.hosts().len(), 1);
-        assert_eq!(catalog.hosts()[0].alias, "hashed-port");
+        assert_eq!(fixture.aliases(), ["hashed-port"]);
     }
 
     #[test]
     fn invalid_ports_are_rejected() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host prod\n  Port 70000\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host prod\n  Port 70000\n");
 
-        let error = Catalog::load_with_home(&config, home)
-            .unwrap_err()
-            .to_string();
+        let error = fixture.load().unwrap_err().to_string();
         assert!(error.contains("invalid Port"));
     }
 
     #[test]
     fn malformed_conservative_candidates_do_not_block_reachable_aliases() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host *\n  Include candidates/%h\n");
-        write(&home.join(".ssh/candidates/good"), "Host good\n");
+        let fixture = Fixture::new();
+        let home = fixture.home();
+        fixture.write(".ssh/config", "Host *\n  Include candidates/%h\n");
+        fixture.write(".ssh/candidates/good", "Host good\n");
         let malformed = home.join(".ssh/candidates/bad");
         fs::write(&malformed, [0xff, 0xfe]).unwrap();
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
 
         assert_eq!(aliases, ["good"]);
         assert!(catalog
@@ -3897,21 +3383,16 @@ Host staging
     fn dangling_conservative_candidates_warn_but_exact_candidates_error() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let candidates = home.join(".ssh/candidates");
-        write(&config, "Host *\n  Include candidates/%h.conf\n");
+        fixture.write(".ssh/config", "Host *\n  Include candidates/%h.conf\n");
         write(&candidates.join("good.conf"), "Host good\n");
         let stale = candidates.join("stale.conf");
         symlink("missing.conf", &stale).unwrap();
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
         assert_eq!(aliases, ["good"]);
         assert!(catalog.warnings().iter().any(|warning| {
             warning.contains("conservative Include candidate") && warning.contains("stale.conf")
@@ -3932,15 +3413,14 @@ Host staging
     fn unreadable_exact_glob_entries_do_not_block_readable_aliases() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
+        let fixture = Fixture::new();
+        let home = fixture.home();
         let blocked = home.join(".ssh/blocked");
-        write(&config, "Include readable.conf\nInclude blocked/*.conf\n");
-        write(
-            &home.join(".ssh/readable.conf"),
-            "Host kept\n  HostName kept.example\n",
+        fixture.write(
+            ".ssh/config",
+            "Include readable.conf\nInclude blocked/*.conf\n",
         );
+        fixture.write(".ssh/readable.conf", "Host kept\n  HostName kept.example\n");
         write(&blocked.join("hidden.conf"), "Host hidden\n");
 
         let original_permissions = fs::metadata(&blocked).unwrap().permissions();
@@ -3952,7 +3432,7 @@ Host staging
             return;
         }
 
-        let result = Catalog::load_with_home(&config, home);
+        let result = fixture.load();
         fs::set_permissions(&blocked, original_permissions).unwrap();
         let catalog = result.unwrap();
 
@@ -3966,38 +3446,24 @@ Host staging
 
     #[test]
     fn treats_consecutive_stars_like_a_libc_glob() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Include tree/**/hosts.conf\nHost root\n");
-        write(&home.join(".ssh/tree/one/hosts.conf"), "Host shallow\n");
-        write(
-            &home.join(".ssh/tree/one/two/hosts.conf"),
-            "Host recursive-only\n",
-        );
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Include tree/**/hosts.conf\nHost root\n");
+        fixture.write(".ssh/tree/one/hosts.conf", "Host shallow\n");
+        fixture.write(".ssh/tree/one/two/hosts.conf", "Host recursive-only\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["shallow", "root"]);
+        assert_eq!(fixture.aliases(), ["shallow", "root"]);
         assert_eq!(collapse_repeated_stars("a/***/b**c"), "a/*/b*c");
     }
 
     #[test]
     fn quoted_values_comments_and_equals_are_supported_but_invalid_aliases_are_skipped() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host=\"my lab\" plain # comment\n  HostName = host.example\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
         assert_eq!(catalog.hosts().len(), 1);
         assert_eq!(catalog.hosts()[0].alias, "plain");
         assert_eq!(
@@ -4008,21 +3474,13 @@ Host staging
 
     #[test]
     fn unspaced_equals_is_a_separator_but_protected_equals_is_data() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Include =included.conf\nHost =plain\n  Port =0022\nHost ==literal\nHost \"=protected\"\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Include =included.conf\nHost =plain\n  Port =0022\nHost ==literal\nHost \"=protected\"\n",
         );
-        write(&home.join(".ssh/included.conf"), "Host included\n");
+        fixture.write(".ssh/included.conf", "Host included\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
         assert_eq!(aliases, ["included", "plain", "=literal", "=protected"]);
         assert_eq!(
             catalog
@@ -4052,22 +3510,11 @@ Host staging
 
     #[test]
     fn aliases_must_remain_literal_ssh_host_arguments() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host \"my lab\" -prod foo@bar ssh://uri.example SSH://literal \"bad;name\" valid-alias\n",
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host \"my lab\" -prod foo@bar ssh://uri.example SSH://literal \"bad;name\" valid-alias\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-
-        assert_eq!(aliases, ["SSH://literal", "valid-alias"]);
+        assert_eq!(fixture.aliases(), ["SSH://literal", "valid-alias"]);
     }
 
     #[test]
@@ -4081,20 +3528,14 @@ Host staging
 
     #[test]
     fn lexer_preserves_inline_comments_and_unrecognized_escapes() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host \"=foo\" prod#blue prod\\q valid # trailing comment\n  Port 23456\n",
         );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
+        let catalog = fixture.load().unwrap();
+        let aliases = aliases(&catalog);
         assert_eq!(aliases, ["=foo", "prod#blue", "valid"]);
         assert!(!aliases.contains(&"foo"));
         assert!(!aliases.contains(&"prod"));
@@ -4146,30 +3587,21 @@ Host staging
 
     #[test]
     fn aliases_are_deduplicated_case_insensitively() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host Production\nHost production\nHost other\n");
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "Host Production\nHost production\nHost other\n",
+        );
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        let aliases: Vec<&str> = catalog
-            .hosts()
-            .iter()
-            .map(|host| host.alias.as_str())
-            .collect();
-        assert_eq!(aliases, ["Production", "other"]);
+        assert_eq!(fixture.aliases(), ["Production", "other"]);
     }
 
     #[test]
     fn negated_patterns_can_exclude_a_concrete_alias() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host foo !f* bar\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host foo !f* bar\n");
 
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
-        assert_eq!(catalog.hosts().len(), 1);
-        assert_eq!(catalog.hosts()[0].alias, "bar");
+        assert_eq!(fixture.aliases(), ["bar"]);
     }
 
     #[test]
@@ -4184,28 +3616,22 @@ Host staging
 
     #[test]
     fn malformed_quotes_report_the_file_and_line() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(&config, "Host \"unterminated\n");
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "Host \"unterminated\n");
 
-        let error = Catalog::load_with_home(&config, home)
-            .unwrap_err()
-            .to_string();
+        let error = fixture.load().unwrap_err().to_string();
         assert!(error.contains(":1:"));
         assert!(error.contains("unterminated"));
     }
 
     #[test]
     fn fuzzy_filter_matches_alias_hostname_and_user() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
             "Host production\n HostName api.internal\n User deploy\nHost other\n",
         );
-        let catalog = Catalog::load_with_home(&config, home).unwrap();
+        let catalog = fixture.load().unwrap();
 
         assert_eq!(catalog.filtered_indices("prd"), [0]);
         assert_eq!(catalog.filtered_indices("api"), [0]);
