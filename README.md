@@ -57,7 +57,7 @@ tar -xzf porteiro-<version>-<target>.tar.gz
 install -m 0755 porteiro-<version>-<target>/porteiro ~/.local/bin/porteiro
 ```
 
-**From source** with a stable Rust toolchain (1.87 or newer):
+**From source** with a stable Rust toolchain (1.88 or newer):
 
 ```sh
 cargo install --git https://github.com/jujubetsz/porteiro --locked

@@ -2,7 +2,10 @@
 name = "porteiro"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+# Resolver 3 makes cargo update (including Dependabot) prefer dependency
+# versions compatible with rust-version instead of breaking the MSRV job.
+resolver = "3"
+rust-version = "1.88"
 description = "Keyboard-first TUI for SSH config hosts"
 readme = "README.md"
 repository = "https://github.com/jujubetsz/porteiro"
