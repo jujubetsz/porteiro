@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches Cargo.toml
+        run: grep -qx "version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="porteiro-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/porteiro" README.md LICENSE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
