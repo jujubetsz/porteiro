@@ -132,6 +132,7 @@ pub enum CatalogError {
     #[error("cannot determine the local account identity used by OpenSSH: {0}")]
     AccountIdentity(io::Error),
 
+    #[cfg(unix)]
     #[error(
         "unsafe permissions on included SSH config {path}: owner uid {owner}, mode {mode:#06o}; OpenSSH requires ownership by root or uid {expected_owner} and no group/world write bits"
     )]

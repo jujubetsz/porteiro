@@ -54,7 +54,7 @@ impl SshClient {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_timeout(binary: PathBuf, config: PathBuf, timeout: Duration) -> Self {
         Self {
             binary,
@@ -277,11 +277,12 @@ fn status_label(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
-    use tempfile::TempDir;
-
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use tempfile::TempDir;
 
     #[test]
     fn parses_effective_config_and_formats_destination() {

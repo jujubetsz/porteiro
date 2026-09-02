@@ -70,10 +70,13 @@ fn exit_code_value(status: ExitStatus) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_code_value, finish_ui};
+    #[cfg(unix)]
+    use super::exit_code_value;
+    use super::finish_ui;
     use crate::ui::Outcome;
     use std::cell::Cell;
     use std::io;
+    #[cfg(unix)]
     use std::process::Command;
 
     #[test]
