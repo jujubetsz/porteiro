@@ -113,7 +113,10 @@ terminals by dropping optional columns before truncating essential fields.
 The supported toolchain is stable Rust. `nix develop` provides the complete
 development shell when local Rust tooling is unavailable.
 
-Run the full gate before committing:
+Run the full gate before committing. GitHub Actions runs the same gate on
+Linux and macOS, plus a Windows `cargo check`, the MSRV check declared in
+`Cargo.toml` and a dependency audit; pushing a `v*` tag builds the release
+binaries.
 
 ```sh
 cargo fmt --all --check
