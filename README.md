@@ -141,7 +141,8 @@ cargo build --release --all-features
 CI runs the same gate on Linux and macOS plus a Windows `cargo check`, a
 minimum supported Rust version check and a dependency audit. Pushing a tag
 `vX.Y.Z` that matches the version in `Cargo.toml` builds release binaries for
-Linux and macOS and publishes them with generated release notes.
+x86_64 Linux and Apple Silicon macOS and publishes them with generated release
+notes.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
 [AGENTS.md](AGENTS.md) for the product contract, invariants and architecture.
