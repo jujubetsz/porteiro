@@ -142,6 +142,81 @@ pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{Catalog, Host, HostHints};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn app() -> App {
+        let host = |alias: &str, hostname: &str| Host {
+            alias: alias.into(),
+            source: PathBuf::from("/home/tester/.ssh/config"),
+            line: 1,
+            hints: HostHints {
+                hostname: Some(hostname.into()),
+                ..HostHints::default()
+            },
+        };
+        App::new(Catalog::from_hosts_for_test(vec![
+            host("production", "api.internal"),
+            host("staging", "staging.internal"),
+        ]))
+    }
+
+    fn rendered(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn wide_terminals_show_columns_details_pane_and_hints() {
+        let screen = rendered(&app(), 120, 24);
+        assert!(screen.contains("porteiro"));
+        assert!(screen.contains("Hosts - 2 shown / 2 total"));
+        assert!(screen.contains("HostName") && screen.contains("api.internal"));
+        assert!(screen.contains("staging.internal"));
+        assert!(screen.contains("Details"));
+        assert!(screen.contains("2 host(s) | /home/tester/.ssh/config"));
+        assert!(screen.contains("j/k move"));
+    }
+
+    #[test]
+    fn narrow_terminals_drop_optional_columns_and_the_details_pane() {
+        let screen = rendered(&app(), 40, 12);
+        assert!(screen.contains("production") && screen.contains("staging"));
+        assert!(!screen.contains("HostName"));
+        assert!(!screen.contains("Details"));
+    }
+
+    #[test]
+    fn overlays_render_on_top_of_the_list() {
+        let mut app = app();
+        app.show_detail_overlay = true;
+        assert!(rendered(&app, 120, 24).contains("Details - Esc to close"));
+
+        app.show_detail_overlay = false;
+        app.show_help = true;
+        let screen = rendered(&app, 120, 24);
+        assert!(screen.contains(" Help ") && screen.contains("toggle help"));
+    }
+
+    #[test]
+    fn search_and_empty_results_are_explained_in_place() {
+        let mut app = app();
+        app.filter_focused = true;
+        app.filter = "nothing-matches".into();
+        let screen = rendered(&app, 120, 24);
+        assert!(screen.contains("search: nothing-matches_"));
+        assert!(screen.contains("Nothing matches the current search"));
+        assert!(screen.contains("type to search"));
+    }
 
     #[test]
     fn centered_overlay_is_clamped_to_small_terminals() {
