@@ -81,17 +81,7 @@ impl App {
             self.selected = 0;
             return None;
         }
-        self.selected = if delta < 0 {
-            if self.selected == 0 {
-                length - 1
-            } else {
-                self.selected - 1
-            }
-        } else if self.selected + 1 >= length {
-            0
-        } else {
-            self.selected + 1
-        };
+        self.selected = (self.selected + length).saturating_add_signed(delta) % length;
         self.resolve_action()
     }
 
