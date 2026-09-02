@@ -76,9 +76,10 @@ impl SshClient {
             .with_context(|| format!("cannot parse effective SSH config for {alias:?}"))
     }
 
-    pub fn connect(&self, alias: &str) -> Result<ExitStatus> {
+    /// Runs the real ssh client for `alias`, adding `verbosity` `-v` flags.
+    pub fn connect(&self, alias: &str, verbosity: u8) -> Result<ExitStatus> {
         Command::new(&self.binary)
-            .args(self.connect_args(alias))
+            .args(self.connect_args(alias, verbosity))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -100,13 +101,14 @@ impl SshClient {
         ]
     }
 
-    fn connect_args(&self, alias: &str) -> Vec<OsString> {
-        vec![
-            OsString::from("-F"),
-            self.config.as_os_str().to_owned(),
-            OsString::from("--"),
-            OsString::from(alias),
-        ]
+    fn connect_args(&self, alias: &str, verbosity: u8) -> Vec<OsString> {
+        let mut arguments = vec![OsString::from("-F"), self.config.as_os_str().to_owned()];
+        arguments.extend(std::iter::repeat_n(
+            OsString::from("-v"),
+            usize::from(verbosity),
+        ));
+        arguments.extend([OsString::from("--"), OsString::from(alias)]);
+        arguments
     }
 
     fn capture(&self, arguments: &[OsString]) -> Result<CapturedOutput> {
@@ -310,9 +312,18 @@ mod tests {
     #[test]
     fn aliases_remain_one_argv_item() {
         let client = SshClient::new(PathBuf::from("ssh"), PathBuf::from("config"));
-        let arguments = client.connect_args("prod; touch /tmp/not-run");
+        let arguments = client.connect_args("prod; touch /tmp/not-run", 0);
         assert_eq!(arguments.len(), 4);
         assert_eq!(arguments[3], OsString::from("prod; touch /tmp/not-run"));
+    }
+
+    #[test]
+    fn verbosity_adds_one_v_flag_per_level_before_the_alias() {
+        let client = SshClient::new(PathBuf::from("ssh"), PathBuf::from("config"));
+        assert_eq!(
+            client.connect_args("prod", 3),
+            ["-F", "config", "-v", "-v", "-v", "--", "prod"].map(OsString::from)
+        );
     }
 
     #[test]
@@ -396,11 +407,11 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let client = SshClient::new(script, PathBuf::from("config path"));
 
-        let status = client.connect("my host").unwrap();
+        let status = client.connect("my host", 1).unwrap();
         assert_eq!(status.code(), Some(7));
         assert_eq!(
             fs::read_to_string(argv_file).unwrap(),
-            "-F\nconfig path\n--\nmy host\n"
+            "-F\nconfig path\n-v\n--\nmy host\n"
         );
     }
 }

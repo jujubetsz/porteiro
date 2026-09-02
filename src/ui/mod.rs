@@ -12,8 +12,18 @@ use std::collections::HashMap;
 
 pub enum Outcome {
     Quit,
-    Connect(String),
+    Connect(Connection),
 }
+
+/// A connection the user asked for: the alias plus the number of `-v` flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection {
+    pub alias: String,
+    pub verbosity: u8,
+}
+
+/// `v` cycles through no flag, `-v`, `-vv` and `-vvv`, OpenSSH's maximum.
+const VERBOSITY_LEVELS: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
@@ -36,6 +46,7 @@ pub struct App {
     pub filter_focused: bool,
     pub show_help: bool,
     pub show_detail_overlay: bool,
+    pub verbosity: u8,
     pub status: Option<String>,
     details: HashMap<String, DetailState>,
 }
@@ -49,6 +60,7 @@ impl App {
             filter_focused: false,
             show_help: false,
             show_detail_overlay: false,
+            verbosity: 0,
             status: None,
             details: HashMap::new(),
         }
@@ -73,6 +85,11 @@ impl App {
 
     fn selected_alias(&self) -> Option<String> {
         self.selected_host().map(|host| host.alias.clone())
+    }
+
+    /// The `-v` flag the next connection passes to ssh, if any.
+    pub fn verbosity_flag(&self) -> Option<String> {
+        (self.verbosity > 0).then(|| format!("-{}", "v".repeat(usize::from(self.verbosity))))
     }
 
     fn move_selection(&mut self, delta: isize) -> Option<Action> {
@@ -154,6 +171,10 @@ impl App {
                 self.resolve_action()
             }
             KeyCode::Char('r') => Some(Action::Reload),
+            KeyCode::Char('v') => {
+                self.verbosity = (self.verbosity + 1) % VERBOSITY_LEVELS;
+                None
+            }
             KeyCode::Enter => self.selected_alias().map(Action::Connect),
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -218,7 +239,12 @@ pub fn run(mut terminal: DefaultTerminal, catalog: Catalog, ssh: &SshClient) -> 
         };
         match action {
             Action::Quit => return Ok(Outcome::Quit),
-            Action::Connect(alias) => return Ok(Outcome::Connect(alias)),
+            Action::Connect(alias) => {
+                return Ok(Outcome::Connect(Connection {
+                    alias,
+                    verbosity: app.verbosity,
+                }))
+            }
             Action::Resolve(alias) => resolve_alias(&mut app, ssh, alias),
             Action::Reload => {
                 let path = app.catalog.config_path().to_path_buf();
@@ -316,6 +342,23 @@ mod tests {
         assert!(!app.filter_focused);
         assert!(app.filter.is_empty());
         assert_eq!(app.selected_host().unwrap().alias, "production");
+    }
+
+    #[test]
+    fn v_cycles_ssh_verbosity_only_outside_search() {
+        let mut app = app();
+        assert_eq!(app.verbosity_flag(), None);
+        for expected in ["-v", "-vv", "-vvv"] {
+            assert_eq!(app.handle_key(press(KeyCode::Char('v'))), None);
+            assert_eq!(app.verbosity_flag().as_deref(), Some(expected));
+        }
+        app.handle_key(press(KeyCode::Char('v')));
+        assert_eq!(app.verbosity, 0);
+
+        app.handle_key(press(KeyCode::Char('/')));
+        app.handle_key(press(KeyCode::Char('v')));
+        assert_eq!(app.verbosity, 0);
+        assert_eq!(app.filter, "v");
     }
 
     #[test]

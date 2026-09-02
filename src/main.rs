@@ -8,7 +8,7 @@ use catalog::Catalog;
 use cli::Cli;
 use ssh::SshClient;
 use std::process::{ExitCode, ExitStatus};
-use ui::Outcome;
+use ui::{Connection, Outcome};
 
 fn main() -> ExitCode {
     match run() {
@@ -28,20 +28,22 @@ fn run() -> Result<ExitCode> {
 
     let terminal = ratatui::init();
     let ui_result = ui::run(terminal, catalog, &ssh);
-    finish_ui(ui_result, ratatui::try_restore, |alias| ssh.connect(alias))
+    finish_ui(ui_result, ratatui::try_restore, |connection| {
+        ssh.connect(&connection.alias, connection.verbosity)
+    })
 }
 
 fn finish_ui<R, C>(ui_result: Result<Outcome>, restore: R, connect: C) -> Result<ExitCode>
 where
     R: FnOnce() -> std::io::Result<()>,
-    C: FnOnce(&str) -> Result<ExitStatus>,
+    C: FnOnce(&Connection) -> Result<ExitStatus>,
 {
     restore().context("cannot restore terminal before leaving the TUI")?;
 
     match ui_result? {
         Outcome::Quit => Ok(ExitCode::SUCCESS),
-        Outcome::Connect(alias) => {
-            let status = connect(&alias)?;
+        Outcome::Connect(connection) => {
+            let status = connect(&connection)?;
             Ok(exit_code(status))
         }
     }
@@ -73,7 +75,7 @@ mod tests {
     #[cfg(unix)]
     use super::exit_code_value;
     use super::finish_ui;
-    use crate::ui::Outcome;
+    use crate::ui::{Connection, Outcome};
     use std::cell::Cell;
     use std::io;
     #[cfg(unix)]
@@ -83,7 +85,10 @@ mod tests {
     fn restore_failure_prevents_connection() {
         let connected = Cell::new(false);
         let result = finish_ui(
-            Ok(Outcome::Connect("production".to_string())),
+            Ok(Outcome::Connect(Connection {
+                alias: "production".to_string(),
+                verbosity: 0,
+            })),
             || Err(io::Error::other("restore failed")),
             |_| {
                 connected.set(true);

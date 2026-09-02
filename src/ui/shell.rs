@@ -74,8 +74,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.catalog.config_path().display().to_string()
     };
+    let verbose = app
+        .verbosity_flag()
+        .map(|flag| format!(" | ssh {flag}"))
+        .unwrap_or_default();
     let text = format!(
-        " {} host(s){warning} | {context}",
+        " {} host(s){warning}{verbose} | {context}",
         app.catalog.hosts().len()
     );
     frame.render_widget(
@@ -88,7 +92,7 @@ fn render_hints(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.filter_focused {
         " type to search   Enter accept   Esc clear"
     } else {
-        " j/k move   / search   Enter connect   i details   r reload   ? help   q quit"
+        " j/k move  / search  Enter connect  i details  r reload  v verbose  ? help  q quit"
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().bg(theme::BG).fg(theme::MUTED)),
@@ -108,6 +112,7 @@ fn render_help(frame: &mut Frame) {
         Line::from("Esc              clear search or close overlay"),
         Line::from("i                technical details"),
         Line::from("r                reload SSH config"),
+        Line::from("v                cycle ssh verbosity: -v, -vv, -vvv"),
         Line::from("?                toggle help"),
         Line::from("q / Ctrl-C       quit"),
     ])
@@ -205,6 +210,16 @@ mod tests {
         app.show_help = true;
         let screen = rendered(&app, 120, 24);
         assert!(screen.contains(" Help ") && screen.contains("toggle help"));
+    }
+
+    #[test]
+    fn verbosity_is_announced_in_the_status_line_and_help() {
+        let mut app = app();
+        assert!(!rendered(&app, 120, 24).contains("| ssh -v"));
+        app.verbosity = 2;
+        assert!(rendered(&app, 120, 24).contains("2 host(s) | ssh -vv |"));
+        app.show_help = true;
+        assert!(rendered(&app, 120, 24).contains("cycle ssh verbosity"));
     }
 
     #[test]

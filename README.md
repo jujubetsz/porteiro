@@ -40,7 +40,8 @@ files.
 - Shows effective HostName, User, Port, ProxyJump, ProxyCommand and
   IdentityFile values from `ssh -G`.
 - Restores the terminal and launches `ssh` directly when you press `Enter`,
-  then returns the SSH exit status to your shell.
+  optionally with `-v`, `-vv` or `-vvv`, then returns the SSH exit status to
+  your shell.
 - Adapts columns and the details pane to the available terminal width.
 
 ## Install
@@ -87,8 +88,12 @@ OpenSSH-compatible executable and is useful when `ssh` is not on `PATH`.
 | `Esc` | Clear search or close an overlay |
 | `i` | Toggle the details overlay |
 | `r` | Reload the config |
+| `v` | Cycle the verbosity of the next connection: `-v`, `-vv`, `-vvv`, off |
 | `?` | Toggle help |
 | `q` / `Ctrl-C` | Quit |
+
+The status line shows the verbosity flag that `Enter` will pass to `ssh`, so
+you can debug a failing connection without leaving the list.
 
 Porteiro exits after the SSH session ends and returns the SSH process exit
 status to the calling shell. On Unix, a session terminated by a signal returns
