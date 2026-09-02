@@ -5,7 +5,6 @@ mod ui;
 
 use anyhow::{Context, Result};
 use catalog::Catalog;
-use clap::Parser;
 use cli::Cli;
 use ssh::SshClient;
 use std::process::{ExitCode, ExitStatus};

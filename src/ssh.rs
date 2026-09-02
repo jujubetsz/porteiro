@@ -4,8 +4,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::Duration;
-use wait_timeout::ChildExt;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -133,12 +132,12 @@ impl SshClient {
             .spawn()
             .with_context(|| format!("cannot start {}", self.binary.display()))?;
 
-        let status = match child
-            .wait_timeout(self.resolve_timeout)
-            .context("cannot wait for ssh -G")?
-        {
-            Some(status) => status,
-            None => {
+        let deadline = Instant::now() + self.resolve_timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("cannot wait for ssh -G")? {
+                break status;
+            }
+            if Instant::now() >= deadline {
                 terminate(&mut child).context("cannot stop timed-out ssh -G")?;
                 child.wait().context("cannot reap timed-out ssh -G")?;
                 return Err(anyhow!(
@@ -146,6 +145,7 @@ impl SshClient {
                     self.resolve_timeout.as_secs_f32()
                 ));
             }
+            std::thread::sleep(Duration::from_millis(10));
         };
 
         Ok(CapturedOutput {

@@ -2261,7 +2261,7 @@ fn current_account_identity() -> io::Result<AccountIdentity> {
         .or_else(|| environment.get("USER"))
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "username is unavailable"))?;
-    let home = dirs::home_dir()
+    let home = std::env::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))?;
     Ok(AccountIdentity {
         username,
