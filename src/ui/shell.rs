@@ -436,7 +436,7 @@ Match originalhost unknown-port exec "exit 0"
         let screen = rendered(&mut app, 96, 20);
         assert!(screen.contains("▾ Work (1)"));
         let row = line_containing(&screen, "production");
-        assert!(row.contains("[prod]") && row.contains("[api]"), "{row}");
+        assert!(row.contains(" prod ") && row.contains(" api "), "{row}");
         assert!(row.contains("-vv"));
 
         let mut terminal = Terminal::new(TestBackend::new(96, 20)).unwrap();
@@ -461,13 +461,58 @@ Match originalhost unknown-port exec "exit 0"
         app.refresh_filter();
         let screen = rendered(&mut app, 24, 12);
         assert!(screen.contains("production"));
-        assert!(!screen.contains("[produção]"));
+        assert!(!screen.contains("produção"));
         assert!(screen.contains("+2"));
         app.show_detail_overlay = true;
         let screen = rendered(&mut app, 100, 24);
         assert!(screen.contains("Tags") && screen.contains("produção, database"));
         for (width, height) in [(1, 1), (4, 3), (12, 5)] {
             rendered(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn tag_badges_keep_their_colors_and_padding_on_selected_and_colored_rows() {
+        let mut app = app();
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts[0].metadata.color = Some(crate::catalog::AccentColor::Red);
+        hosts[1].metadata.color = Some(crate::catalog::AccentColor::Blue);
+        for host in &mut hosts {
+            host.metadata.tags = vec!["prod".into(), "api".into()];
+        }
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        for selected in [0, 1] {
+            app.selected = selected;
+            let mut terminal = Terminal::new(TestBackend::new(96, 20)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let rows: Vec<_> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(96)
+                .filter(|row| row.iter().any(|cell| cell.bg == theme::TAG_BG))
+                .collect();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                let badge_cells: Vec<_> =
+                    row.iter().filter(|cell| cell.bg == theme::TAG_BG).collect();
+                assert_eq!(
+                    badge_cells
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>(),
+                    " prod  api "
+                );
+                assert!(badge_cells.iter().all(
+                    |cell| cell.fg == theme::TAG_FG && !cell.modifier.contains(Modifier::BOLD)
+                ));
+                let first = row
+                    .iter()
+                    .position(|cell| cell.bg == theme::TAG_BG)
+                    .unwrap();
+                assert_ne!(row[first - 1].bg, theme::TAG_BG);
+                assert_ne!(row[first + 6].bg, theme::TAG_BG); // Gap between badges.
+            }
         }
     }
 

@@ -265,8 +265,8 @@ fn alias_line(host: &Host, badge: Option<&str>, width: usize, prefix: &str) -> L
     }
     let mut used: usize = spans.iter().map(Span::width).sum();
     for (index, tag) in host.metadata.tags.iter().enumerate() {
-        let label = format!(" [{tag}]");
-        let label_width = Span::raw(&label).width();
+        let label = format!(" {tag} ");
+        let label_width = 1 + Span::raw(&label).width();
         let remaining = host.metadata.tags.len() - index - 1;
         let suffix = if remaining > 0 {
             format!(" +{remaining}")
@@ -280,9 +280,13 @@ fn alias_line(host: &Host, badge: Option<&str>, width: usize, prefix: &str) -> L
             }
             break;
         }
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
             label,
-            Style::default().fg(theme::accent(host.metadata.color)),
+            Style::default()
+                .fg(theme::TAG_FG)
+                .bg(theme::TAG_BG)
+                .remove_modifier(Modifier::BOLD),
         ));
         used += label_width;
     }
@@ -389,9 +393,34 @@ mod tests {
         let line = alias_line(&host, Some("-vvv"), 20, "└─ ");
         assert!(line.to_string().contains('…'));
         assert!(line.to_string().ends_with(" -vvv "));
-        assert!(!line.to_string().contains("[production]"));
+        assert!(!line.to_string().contains("production"));
         assert_eq!(line.width(), 20);
         assert!(alias_line(&host, Some("-vvv"), 3, "└─ ").width() <= 3);
+    }
+
+    #[test]
+    fn tag_badges_fit_unicode_cells_and_report_overflow_without_cutting_tags() {
+        let host = Host {
+            alias: "api".into(),
+            source: "config".into(),
+            line: 1,
+            hints: Default::default(),
+            metadata: crate::catalog::HostMetadata {
+                tags: vec!["東京".into(), "e\u{301}".into()],
+                ..Default::default()
+            },
+        };
+        let full = alias_line(&host, None, 14, "");
+        assert_eq!(full.to_string(), "api  東京   e\u{301} ");
+        assert_eq!(full.width(), 14);
+        let partial = alias_line(&host, None, 13, "");
+        assert_eq!(partial.to_string(), "api  東京  +1");
+        assert_eq!(partial.width(), 13);
+        let narrow = alias_line(&host, None, 9, "");
+        assert_eq!(narrow.to_string(), "api +2");
+        for width in 0..30 {
+            assert!(alias_line(&host, Some("-vvv"), width, "│  └─ ").width() <= width);
+        }
     }
 
     #[test]

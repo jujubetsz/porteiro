@@ -70,6 +70,8 @@ Keep `group` a literal single-level name; `group_path` splits on `/`, trims each
 component and rejects empty components. Both replace the entire inherited path
 and cannot coexist on one annotation. Use full component paths for group
 identity so literal slashes and identically named subgroups cannot collide.
+Tag badges use their own fixed neutral foreground and background, including
+on selected rows; never inherit the host or group accent color.
 
 ## Architecture
 

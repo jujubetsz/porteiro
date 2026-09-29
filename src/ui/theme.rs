@@ -10,6 +10,8 @@ pub const IDENT: Color = Color::Rgb(0x51, 0xc9, 0xd4);
 pub const BAD: Color = Color::Rgb(0xff, 0x6b, 0x8a);
 pub const MUTED: Color = Color::Rgb(0x8b, 0x90, 0x9a);
 pub const SELECT_BG: Color = Color::Rgb(0x27, 0x4a, 0x44);
+pub const TAG_BG: Color = Color::Rgb(0x3a, 0x3f, 0x49);
+pub const TAG_FG: Color = Color::Rgb(0xe2, 0xe5, 0xea);
 
 /// Use the terminal's named palette for user accents; never interpret metadata
 /// as an ANSI sequence. Text and selection still carry meaning without color.

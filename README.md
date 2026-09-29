@@ -141,7 +141,7 @@ Host standalone
 ```text
 ▸ Work (2)
 ▾ Personal (1)
-└─ personal [homelab]
+└─ personal  homelab
 standalone
 ```
 
@@ -166,9 +166,11 @@ standalone
   with a warning. Annotations do not apply wildcard matching or evaluate
   `Match` criteria. Inline comments after SSH options remain ordinary comments.
 - Colors are `red`, `yellow`, `green`, `blue`, `magenta`, `cyan`, `white`, `gray`
-  or `default`. They accent host names and tag text. A group's header uses the
+  or `default`. They accent host names. A group's header uses the
   color of its first retained host. Selection and labels remain visible without
   relying on color.
+- Tags appear as padded rectangular badges with a fixed neutral background
+  and text color. Their colors stay the same across host accents and selection.
 - Add `# porteiro: hidden=true` inside a `Host` block to hide its aliases from
   Porteiro's list, search and groups. The SSH configuration and direct `ssh`
   connections remain unchanged. This field follows the same file-local defaults
@@ -207,7 +209,7 @@ Host legacy
 ```text
 ▾ Production (3)
 ├─ ▾ APIs (1)
-│  └─ prod-api [api]
+│  └─ prod-api  api
 ├─ ▸ Databases (1)
 └─ bastion
 ▸ Staging (1)
