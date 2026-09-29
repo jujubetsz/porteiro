@@ -416,6 +416,7 @@ Match originalhost unknown-port exec "exit 0"
             group: Some("Work".into()),
             tags: vec!["prod".into(), "api".into()],
             color: Some(crate::catalog::AccentColor::Red),
+            hidden: false,
         };
         app.replace_catalog(Catalog::from_hosts_for_test(hosts));
         app.selected = 0;

@@ -22,6 +22,7 @@ pub struct HostMetadata {
     pub group: Option<String>,
     pub tags: Vec<String>,
     pub color: Option<AccentColor>,
+    pub hidden: bool,
 }
 
 /// An absent field inherits its value; an explicit empty field clears it.
@@ -30,6 +31,7 @@ pub(super) struct Annotation {
     group: Option<Option<String>>,
     tags: Option<Vec<String>>,
     color: Option<Option<AccentColor>>,
+    hidden: Option<bool>,
 }
 
 impl Annotation {
@@ -42,6 +44,9 @@ impl Annotation {
         }
         if let Some(color) = self.color {
             metadata.color = color;
+        }
+        if let Some(hidden) = self.hidden {
+            metadata.hidden = hidden;
         }
     }
 }
@@ -60,7 +65,7 @@ pub(super) fn parse(line: &str) -> Option<Result<Annotation, String>> {
 fn parse_fields(body: &str) -> Result<Annotation, String> {
     let tokens = tokenize(body)?;
     if tokens.is_empty() {
-        return Err("expected group=, tags= or color=".into());
+        return Err("expected group=, tags=, color= or hidden=".into());
     }
     let mut annotation = Annotation::default();
     let mut seen = HashSet::new();
@@ -114,9 +119,16 @@ fn parse_fields(body: &str) -> Result<Annotation, String> {
                     _ => return Err(format!("unknown color {value:?}; use red, yellow, green, blue, magenta, cyan, white, gray or default")),
                 });
             }
+            "hidden" => {
+                annotation.hidden = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err("hidden must be true or false".into()),
+                });
+            }
             _ => {
                 return Err(format!(
-                    "unknown metadata key {key:?}; expected group, tags or color"
+                    "unknown metadata key {key:?}; expected group, tags, color or hidden"
                 ))
             }
         }
@@ -147,8 +159,9 @@ mod tests {
             group: Some("Work".into()),
             tags: vec!["prod".into()],
             color: Some(AccentColor::Blue),
+            hidden: true,
         };
-        parse("# porteiro: group=\"\" tags= color=default")
+        parse("# porteiro: group=\"\" tags= color=default hidden=false")
             .unwrap()
             .unwrap()
             .apply(&mut metadata);
@@ -165,6 +178,9 @@ mod tests {
             "# porteiro: tags=a,,b",
             "# porteiro: groups=Work",
             "# porteiro: group = Work",
+            "# porteiro: hidden=yes",
+            "# porteiro: hidden=",
+            "# porteiro: hidden=true hidden=false",
             "# porteiro: group=\"escape\u{1b}[31m\"",
             "# porteiro: tags=\"prod\u{202e}dev\"",
         ] {

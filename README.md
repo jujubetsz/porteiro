@@ -109,7 +109,7 @@ Porteiro exits after the SSH session ends and returns the SSH process exit
 status to the calling shell. On Unix, a session terminated by a signal returns
 the conventional shell-visible status `128 + signal`.
 
-## Groups, tags and colors
+## Groups, tags, colors and visibility
 
 Add full-line `# porteiro:` comments to your SSH config or included files.
 These are Porteiro annotations, not SSH options. OpenSSH
@@ -164,6 +164,11 @@ Host standalone
   or `default`. They accent host names and tag text. A group's header uses the
   color of its first retained host. Selection and labels remain visible without
   relying on color.
+- Add `# porteiro: hidden=true` inside a `Host` block to hide its aliases from
+  Porteiro's list, search and groups. The SSH configuration and direct `ssh`
+  connections remain unchanged. This field follows the same file-local defaults
+  and declaration rules as other annotations; `hidden=false` overrides a hidden
+  default. Hidden declarations still undergo configuration validation.
 - Malformed annotations are ignored as a whole, with file and line diagnostics
   available through `w`. Unknown keys/colors, duplicate keys on one line and
   control/bidirectional formatting characters are rejected. Ordinary SSH

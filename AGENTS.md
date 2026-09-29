@@ -61,6 +61,10 @@ flows through Include or participates in SSH matching. Keep metadata from the
 retained reachable declaration, not an earlier conservative candidate. Invalid
 annotations warn with file/line and apply no partial update. Reject control and
 bidirectional formatting characters in metadata displayed by the terminal.
+The `hidden=true` annotation excludes a host from the catalog UI only after
+reachability validation and deduplication; it cannot mask configuration errors
+or allow a later declaration to revive a hidden alias. It shares the same
+file-local scope as other metadata, and `hidden=false` clears a hidden default.
 
 ## Architecture
 

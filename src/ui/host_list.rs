@@ -90,7 +90,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = panel(&title);
     if visible.is_empty() {
         let message = if app.filter.trim().is_empty() {
-            "No concrete Host aliases found in this SSH config."
+            "No visible Host aliases found in this SSH config."
         } else {
             "Nothing matches the current search. Press Esc to clear it."
         };
@@ -356,6 +356,7 @@ mod tests {
                 group: Some("Work".into()),
                 tags: vec!["production".into()],
                 color: None,
+                hidden: false,
             },
         };
         let line = alias_line(&host, Some("-vvv"), 20);

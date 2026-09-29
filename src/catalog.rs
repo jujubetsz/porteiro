@@ -311,6 +311,10 @@ impl Builder {
     fn into_catalog(mut self, config_path: &Path, root: &Path) -> Result<Catalog, CatalogError> {
         self.parse_file(root, false, &mut Vec::new(), &mut false, &mut Vec::new())?;
         self.retain_reachable_hosts(root)?;
+        // Visibility uses the retained declaration's metadata. Validate and
+        // deduplicate first: hiding must not mask config errors or let a later
+        // duplicate resurrect an intentionally hidden alias.
+        self.hosts.retain(|host| !host.metadata.hidden);
         Ok(Catalog {
             config_path: config_path.to_path_buf(),
             hosts: self.hosts,
@@ -2547,6 +2551,61 @@ Host sibling
             "# porteiro: group=Cycle\nInclude config\n",
         );
         assert!(fixture.load().unwrap_err().to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn hidden_hosts_use_file_defaults_and_explicit_overrides_without_changing_ssh_hints() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "# porteiro: hidden=true\nInclude child.conf\nHost secret secret-alt\nHost visible\n# porteiro: hidden=false\nHost SECRET\n# porteiro: hidden=false\nHost *\nUser deploy\nPort 2222\n",
+        );
+        fixture.write(".ssh/child.conf", "Host child\n");
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["child", "visible"]);
+        assert!(catalog.warnings().is_empty());
+        assert!(catalog.filtered_indices("secret").is_empty());
+        assert!(catalog.hosts().iter().all(|host| {
+            host.hints.user.as_deref() == Some("deploy")
+                && host.hints.port.as_deref() == Some("2222")
+        }));
+    }
+
+    #[test]
+    fn hidden_annotations_use_the_reachable_origin_and_invalid_updates_are_atomic() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "Host gate\nInclude conditional.conf\nHost *\nInclude global.conf\n# porteiro: hidden=true\nMatch all\n# porteiro: hidden=true\n",
+        );
+        fixture.write(
+            ".ssh/conditional.conf",
+            "Host visible\n# porteiro: hidden=true\nHost secret\n",
+        );
+        fixture.write(
+            ".ssh/global.conf",
+            "Host visible\n# porteiro: hidden=true color=invalid\nHost secret\n# porteiro: hidden=true\n",
+        );
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["gate", "visible"]);
+        assert_eq!(catalog.warnings().len(), 3);
+        assert!(catalog
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("global.conf:2:")));
+    }
+
+    #[test]
+    fn hiding_all_hosts_does_not_skip_reachable_include_errors() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "Host secret\n# porteiro: hidden=true\nInclude cycle.conf\n",
+        );
+        fixture.write(".ssh/cycle.conf", "Include config\n");
+        assert!(fixture.load().unwrap_err().to_string().contains("cycle"));
+        fixture.write(".ssh/cycle.conf", "# no cycle\n");
+        assert!(fixture.load().unwrap().hosts().is_empty());
     }
 
     #[test]
