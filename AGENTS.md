@@ -133,8 +133,11 @@ development shell when local Rust tooling is unavailable.
 
 Run the full gate before committing. GitHub Actions runs the same gate on
 Linux and macOS, plus a Windows `cargo check`, the MSRV check declared in
-`Cargo.toml` and a dependency audit; pushing a `v*` tag builds the release
-binaries.
+`Cargo.toml` and a dependency audit. After successful checks on `main`,
+release-please manages release PRs, version bumps and changelogs. Merging a
+release PR and passing CI creates its tag and release, then calls the reusable
+release workflow to build binaries from that exact tag. Keep version changes
+in the bot's release PR; use the Release workflow's tag input to retry assets.
 
 ```sh
 cargo fmt --all --check

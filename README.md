@@ -225,10 +225,15 @@ cargo build --release --all-features
 ```
 
 CI runs the same gate on Linux and macOS plus a Windows `cargo check`, a
-minimum supported Rust version check and a dependency audit. Pushing a tag
-`vX.Y.Z` that matches the version in `Cargo.toml` builds release binaries for
-x86_64 Linux and Apple Silicon macOS and publishes them with generated release
-notes.
+minimum supported Rust version check and a dependency audit. After successful
+checks on `main`, release-please maintains a release PR from conventional
+commits, updating `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md`.
+
+Merging the release PR and passing CI creates the `vX.Y.Z` tag and GitHub
+release. The same pipeline builds x86_64 Linux and Apple Silicon macOS
+binaries from that tag and attaches the archives and SHA-256 checksums.
+See the [release workflow](CONTRIBUTING.md#releases) for repository setup and
+retrying a failed upload.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
 [AGENTS.md](AGENTS.md) for the product contract, invariants and architecture.

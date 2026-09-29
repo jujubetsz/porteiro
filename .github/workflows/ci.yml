@@ -66,3 +66,37 @@ jobs:
       # Plain cargo audit reports in the job log, so it needs no checks:write
       # permission and also works on Dependabot pull requests.
       - run: cargo audit
+
+  release-please:
+    name: Prepare release
+    needs: [gate, windows-check, msrv, audit]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-please-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish-release:
+    name: Release binaries
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    # GITHUB_TOKEN-created tags do not trigger another push workflow.
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
