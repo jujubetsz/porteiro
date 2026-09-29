@@ -413,7 +413,7 @@ Match originalhost unknown-port exec "exit 0"
         let mut app = app();
         let mut hosts = app.catalog.hosts().to_vec();
         hosts[0].metadata = crate::catalog::HostMetadata {
-            group: Some("Work".into()),
+            group: vec!["Work".into()],
             tags: vec!["prod".into(), "api".into()],
             color: Some(crate::catalog::AccentColor::Red),
             hidden: false,
@@ -454,7 +454,7 @@ Match originalhost unknown-port exec "exit 0"
     fn narrow_grouped_rows_preserve_aliases_and_details_retain_all_tags() {
         let mut app = app();
         let mut hosts = app.catalog.hosts().to_vec();
-        hosts[0].metadata.group = Some("Equipe 東京".into());
+        hosts[0].metadata.group = vec!["Equipe 東京".into()];
         hosts[0].metadata.tags = vec!["produção".into(), "database".into()];
         app.replace_catalog(Catalog::from_hosts_for_test(hosts));
         app.filter = "production".into();
@@ -466,6 +466,83 @@ Match originalhost unknown-port exec "exit 0"
         app.show_detail_overlay = true;
         let screen = rendered(&mut app, 100, 24);
         assert!(screen.contains("Tags") && screen.contains("produção, database"));
+        for (width, height) in [(1, 1), (4, 3), (12, 5)] {
+            rendered(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn nested_tree_renders_connectors_descendant_counts_and_omits_hidden_groups() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        std::fs::write(&config, "Host api-one api-two\n# porteiro: group_path=Production/APIs\nHost database\n# porteiro: group_path=Production/Data\nHost bastion\n# porteiro: group=Production\nHost other\n# porteiro: group_path=Staging/APIs\nHost secret\n# porteiro: group_path=Hidden/Private hidden=true\n").unwrap();
+        let mut app = App::new(Catalog::load(&config).unwrap());
+        let screen = rendered(&mut app, 100, 24);
+        assert!(screen.contains("▸ Production (4)"));
+        assert!(screen.contains("▸ Staging (1)"));
+        assert!(!screen.contains("Hidden") && !screen.contains("secret"));
+
+        app.filter = "Production".into();
+        app.refresh_filter();
+        let screen = rendered(&mut app, 100, 24);
+        for branch in [
+            "├─ ▾ APIs (2)",
+            "│  ├─ api-one",
+            "│  └─ api-two",
+            "├─ ▾ Data (1)",
+            "│  └─ database",
+            "└─ bastion",
+        ] {
+            assert!(screen.contains(branch), "missing {branch:?}:\n{screen}");
+        }
+        assert!(!screen.contains("Staging"));
+
+        app.filter = "api-one".into();
+        app.refresh_filter();
+        let screen = rendered(&mut app, 100, 24);
+        assert!(screen.contains("▾ Production (1/4)"));
+        assert!(screen.contains("└─ ▾ APIs (1/2)"));
+        assert!(screen.contains("   └─ api-one"));
+        assert!(!screen.contains("│  └─ api-one"));
+        app.show_detail_overlay = true;
+        assert!(rendered(&mut app, 100, 24).contains("Production / APIs"));
+    }
+
+    #[test]
+    fn an_all_hidden_catalog_explains_the_empty_list_and_cannot_connect() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        std::fs::write(
+            &config,
+            "Host secret\n# porteiro: hidden=true group_path=Hidden/Private\n",
+        )
+        .unwrap();
+        let mut app = App::new(Catalog::load(&config).unwrap());
+        let screen = rendered(&mut app, 100, 24);
+        assert!(screen.contains("No visible Host aliases"));
+        assert!(screen.contains("0 shown / 0 total"));
+        assert_eq!(
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn deep_group_paths_keep_the_selected_alias_readable_in_a_narrow_terminal() {
+        let mut app = app();
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts[0].metadata.group = (0..64).map(|index| format!("東京 {index}")).collect();
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        app.filter = "production".into();
+        app.refresh_filter();
+        app.verbosity = 3;
+        let screen = rendered(&mut app, 36, 12);
+        let row = line_containing(&screen, "production");
+        assert!(row.contains("-vvv"));
+        assert!(row.contains('…'));
         for (width, height) in [(1, 1), (4, 3), (12, 5)] {
             rendered(&mut app, width, height);
         }

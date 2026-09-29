@@ -34,13 +34,14 @@ pub struct Host {
 
 impl Host {
     pub fn search_score(&self, query: &str) -> Option<i64> {
+        let group_path = self.metadata.group.join("/");
         [
             self.alias.as_str(),
             self.hints.hostname.as_deref().unwrap_or_default(),
             self.hints.user.as_deref().unwrap_or_default(),
             self.hints.port.as_deref().unwrap_or_default(),
             self.hints.proxy_jump.as_deref().unwrap_or_default(),
-            self.metadata.group.as_deref().unwrap_or_default(),
+            group_path.as_str(),
         ]
         .into_iter()
         .chain(self.metadata.tags.iter().map(String::as_str))
@@ -2441,12 +2442,12 @@ Host API
         );
         let hosts = catalog.hosts();
         assert_eq!(hosts[0].metadata, hosts[1].metadata);
-        assert_eq!(hosts[0].metadata.group.as_deref(), Some("Work Team"));
+        assert_eq!(hosts[0].metadata.group, ["Work Team"]);
         assert_eq!(hosts[0].metadata.tags, ["prod", "api"]);
         assert_eq!(hosts[0].metadata.color, Some(AccentColor::Red));
         assert_eq!(hosts[2].metadata.tags, ["company"]);
         assert_eq!(hosts[2].metadata.color, Some(AccentColor::Blue));
-        assert_eq!(hosts[3].metadata.group.as_deref(), Some("Personal"));
+        assert_eq!(hosts[3].metadata.group, ["Personal"]);
         assert_eq!(hosts[4].metadata, HostMetadata::default());
         assert_eq!(catalog.filtered_indices("Work Team").len(), 3);
         assert_eq!(catalog.filtered_indices("prod"), [0, 1]);
@@ -2478,10 +2479,10 @@ Host sibling
         let catalog = fixture.load().unwrap();
         assert_eq!(aliases(&catalog), ["child", "plain", "parent", "sibling"]);
         let hosts = catalog.hosts();
-        assert_eq!(hosts[0].metadata.group.as_deref(), Some("Child"));
+        assert_eq!(hosts[0].metadata.group, ["Child"]);
         assert_eq!(hosts[0].metadata.color, None);
         assert_eq!(hosts[1].metadata, HostMetadata::default());
-        assert_eq!(hosts[2].metadata.group.as_deref(), Some("Root"));
+        assert_eq!(hosts[2].metadata.group, ["Root"]);
         assert_eq!(hosts[2].metadata.color, Some(AccentColor::Blue));
         assert_eq!(hosts[2].metadata.tags, ["parent"]);
         assert_eq!(hosts[2].hints.user.as_deref(), Some("deploy"));
@@ -2505,10 +2506,7 @@ Host sibling
         );
         let catalog = fixture.load().unwrap();
         assert_eq!(aliases(&catalog), ["gate", "duplicate"]);
-        assert_eq!(
-            catalog.hosts()[1].metadata.group.as_deref(),
-            Some("Reachable")
-        );
+        assert_eq!(catalog.hosts()[1].metadata.group, ["Reachable"]);
     }
 
     #[test]
@@ -2520,7 +2518,7 @@ Host sibling
         assert!(catalog
             .hosts()
             .iter()
-            .all(|host| host.metadata.group.as_deref() == Some("Work")));
+            .all(|host| host.metadata.group == ["Work"]));
         assert_eq!(catalog.warnings().len(), 3);
         assert!(catalog.warnings()[0].contains("config:3: ignored porteiro annotation"));
         assert!(catalog.warnings()[0].contains("unknown color"));
@@ -2551,6 +2549,40 @@ Host sibling
             "# porteiro: group=Cycle\nInclude config\n",
         );
         assert!(fixture.load().unwrap_err().to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn nested_group_defaults_override_atomically_and_remain_file_local() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            r#"
+# porteiro: group_path="Work / Production" tags=company
+Include child.conf
+Host api
+Host flat
+    # porteiro: group="Work/Production"
+Host overridden
+    # porteiro: group_path="Work/Staging"
+Host standalone
+    # porteiro: group_path=""
+Host invalid
+    # porteiro: group_path="Work//Wrong" tags=wrong
+"#,
+        );
+        fixture.write(".ssh/child.conf", "Host child\n");
+        let catalog = fixture.load().unwrap();
+        let hosts = catalog.hosts();
+        assert!(hosts[0].metadata.group.is_empty());
+        assert_eq!(hosts[1].metadata.group, ["Work", "Production"]);
+        assert_eq!(hosts[2].metadata.group, ["Work/Production"]);
+        assert_eq!(hosts[3].metadata.group, ["Work", "Staging"]);
+        assert!(hosts[4].metadata.group.is_empty());
+        assert_eq!(hosts[5].metadata.group, ["Work", "Production"]);
+        assert_eq!(hosts[5].metadata.tags, ["company"]);
+        assert_eq!(catalog.filtered_indices("Work/Production"), [1, 2, 5]);
+        assert_eq!(catalog.warnings().len(), 1);
+        assert!(catalog.warnings()[0].contains("config:12:"));
     }
 
     #[test]

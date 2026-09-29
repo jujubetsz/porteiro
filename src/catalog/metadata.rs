@@ -19,7 +19,8 @@ pub enum AccentColor {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostMetadata {
-    pub group: Option<String>,
+    /// A literal group is one component; group_path supplies multiple levels.
+    pub group: Vec<String>,
     pub tags: Vec<String>,
     pub color: Option<AccentColor>,
     pub hidden: bool,
@@ -28,7 +29,7 @@ pub struct HostMetadata {
 /// An absent field inherits its value; an explicit empty field clears it.
 #[derive(Default)]
 pub(super) struct Annotation {
-    group: Option<Option<String>>,
+    group: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     color: Option<Option<AccentColor>>,
     hidden: Option<bool>,
@@ -65,7 +66,7 @@ pub(super) fn parse(line: &str) -> Option<Result<Annotation, String>> {
 fn parse_fields(body: &str) -> Result<Annotation, String> {
     let tokens = tokenize(body)?;
     if tokens.is_empty() {
-        return Err("expected group=, tags=, color= or hidden=".into());
+        return Err("expected group=, group_path=, tags=, color= or hidden=".into());
     }
     let mut annotation = Annotation::default();
     let mut seen = HashSet::new();
@@ -86,9 +87,22 @@ fn parse_fields(body: &str) -> Result<Annotation, String> {
             return Err("metadata values cannot contain control or bidi formatting characters".into());
         }
         match key {
-            "group" => {
+            "group" | "group_path" => {
+                if annotation.group.is_some() {
+                    return Err("use either group or group_path on one annotation".into());
+                }
                 let name = value.trim();
-                annotation.group = Some((!name.is_empty()).then(|| name.to_string()));
+                annotation.group = Some(if name.is_empty() {
+                    Vec::new()
+                } else if key == "group" {
+                    vec![name.to_string()]
+                } else {
+                    let parts: Vec<_> = name.split('/').map(str::trim).collect();
+                    if parts.iter().any(|part| part.is_empty()) {
+                        return Err("group_path must contain nonempty names separated by /".into());
+                    }
+                    parts.into_iter().map(str::to_string).collect()
+                });
             }
             "tags" => {
                 let mut tags = Vec::new();
@@ -127,9 +141,8 @@ fn parse_fields(body: &str) -> Result<Annotation, String> {
                 });
             }
             _ => {
-                return Err(format!(
-                    "unknown metadata key {key:?}; expected group, tags, color or hidden"
-                ))
+                let expected = "group, group_path, tags, color or hidden";
+                return Err(format!("unknown metadata key {key:?}; expected {expected}"));
             }
         }
     }
@@ -148,7 +161,7 @@ mod tests {
                 .unwrap();
         let mut metadata = HostMetadata::default();
         annotation.apply(&mut metadata);
-        assert_eq!(metadata.group.as_deref(), Some("Equipe São Paulo"));
+        assert_eq!(metadata.group, ["Equipe São Paulo"]);
         assert_eq!(metadata.tags, ["prod", "api"]);
         assert_eq!(metadata.color, Some(AccentColor::Red));
     }
@@ -156,7 +169,7 @@ mod tests {
     #[test]
     fn explicit_resets_clear_inherited_values() {
         let mut metadata = HostMetadata {
-            group: Some("Work".into()),
+            group: vec!["Work".into()],
             tags: vec!["prod".into()],
             color: Some(AccentColor::Blue),
             hidden: true,
@@ -166,6 +179,26 @@ mod tests {
             .unwrap()
             .apply(&mut metadata);
         assert_eq!(metadata, HostMetadata::default());
+    }
+
+    #[test]
+    fn group_paths_trim_components_and_literal_groups_keep_slashes() {
+        let mut metadata = HostMetadata::default();
+        parse("# porteiro: group_path=' Produção / APIs / São Paulo ' # note")
+            .unwrap()
+            .unwrap()
+            .apply(&mut metadata);
+        assert_eq!(metadata.group, ["Produção", "APIs", "São Paulo"]);
+        parse("# porteiro: group='Work/Production'")
+            .unwrap()
+            .unwrap()
+            .apply(&mut metadata);
+        assert_eq!(metadata.group, ["Work/Production"]);
+        parse("# porteiro: group_path=\"\"")
+            .unwrap()
+            .unwrap()
+            .apply(&mut metadata);
+        assert!(metadata.group.is_empty());
     }
 
     #[test]
@@ -181,6 +214,14 @@ mod tests {
             "# porteiro: hidden=yes",
             "# porteiro: hidden=",
             "# porteiro: hidden=true hidden=false",
+            "# porteiro: group_path=Work//Production",
+            "# porteiro: group_path=/Production",
+            "# porteiro: group_path=Production/",
+            "# porteiro: group_path='Production/ /APIs'",
+            "# porteiro: group=Work group_path=Work/Production",
+            "# porteiro: group_path=Work/Production group=Work",
+            "# porteiro: group_path=One group_path=Two",
+            "# porteiro: group_path='Production/\u{202e}APIs'",
             "# porteiro: group=\"escape\u{1b}[31m\"",
             "# porteiro: tags=\"prod\u{202e}dev\"",
         ] {

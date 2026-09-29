@@ -141,13 +141,18 @@ Host standalone
 ```text
 ▸ Work (2)
 ▾ Personal (1)
-    personal [homelab]
-  standalone
+└─ personal [homelab]
+standalone
 ```
 
 - Each host has at most one group and any number of comma-separated tags.
   Quote names containing spaces. Group and tag names are case-sensitive;
   search is case-insensitive. Repeated tags are shown once, in written order.
+- For nested groups, use `group_path="Production/APIs"`. Each `/` introduces
+  another level; spaces around each name are trimmed and empty components are
+  rejected. `group="Production/APIs"` remains a single literal group for
+  compatibility. Use only one of `group` and `group_path` on the same annotation;
+  either replaces the whole inherited path. `group_path=""` clears grouping.
 - Annotations before the first `Host` or `Match` in a file set that file's
   defaults. Inside a `Host` block they override fields for the concrete aliases
   declared in that block. The last valid annotation for a field wins;
@@ -174,16 +179,44 @@ Host standalone
   control/bidirectional formatting characters are rejected. Ordinary SSH
   syntax and Include errors retain their existing handling.
 
-Groups start collapsed above ungrouped hosts. Groups follow their first
-appearance, and hosts within them retain declaration order. Search also matches
-group names and tags, temporarily opens matching groups and ranks matching hosts
-within each group. Clearing the query restores the previous expansion state.
+Groups start collapsed above ungrouped hosts. At each level, subgroups follow
+their first appearance and precede directly assigned hosts, which retain
+declaration order. Counts include all descendant hosts. Identically named
+subgroups under different parents have independent expansion state. Search also
+matches full group paths and tags, temporarily opens all ancestors of matching
+hosts and ranks matching hosts within each group. Clearing the query restores
+the previous expansion state, including subgroups.
 Reload preserves surviving expanded groups and the selected row when it remains
 visible; expansion is kept only for the current session.
 
+For example:
+
+```sshconfig
+Host prod-api
+    # porteiro: group_path="Production/APIs" tags=api color=red
+Host prod-db
+    # porteiro: group_path="Production/Databases"
+Host bastion
+    # porteiro: group="Production"
+Host staging-api
+    # porteiro: group_path="Staging/APIs"
+Host legacy
+    # porteiro: hidden=true
+```
+
+```text
+▾ Production (3)
+├─ ▾ APIs (1)
+│  └─ prod-api [api]
+├─ ▸ Databases (1)
+└─ bastion
+▸ Staging (1)
+```
+
 Tags share the alias column and give way to the alias and verbosity flag in
 narrow terminals. A `+N` marker reports hidden tags when space permits; `i` shows
-the full group and tag values in the details overlay.
+the full group path and tag values in the details overlay. In a deeply nested
+tree, distant ancestor connectors give way to host names and connection flags.
 
 ## How host discovery works
 

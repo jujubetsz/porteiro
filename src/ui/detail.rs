@@ -36,9 +36,9 @@ fn details_paragraph(app: &App, title: &'static str) -> Paragraph<'static> {
 fn lines(app: &App) -> Vec<Line<'static>> {
     if let Some(group) = app.selected_group() {
         return vec![
-            field("Group", group.name.clone()),
+            field("Group", group.path.join(" / ")),
             field("Hosts", group.total.to_string()),
-            field("Matches", group.matches.len().to_string()),
+            field("Matches", group.matched.to_string()),
             Line::from(""),
             Line::from("Space or Enter to expand / collapse."),
         ];
@@ -51,8 +51,8 @@ fn lines(app: &App) -> Vec<Line<'static>> {
     };
 
     let mut lines = vec![field("Alias", host.alias.clone())];
-    if let Some(group) = &host.metadata.group {
-        lines.push(field("Group", group.clone()));
+    if !host.metadata.group.is_empty() {
+        lines.push(field("Group", host.metadata.group.join(" / ")));
     }
     if !host.metadata.tags.is_empty() {
         lines.push(field("Tags", host.metadata.tags.join(", ")));

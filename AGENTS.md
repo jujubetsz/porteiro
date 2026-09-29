@@ -49,10 +49,11 @@ standard SSH terminology without extending the name into a metaphor.
 
 ## Current scope
 
-The surface is one full-screen host list with fuzzy search, collapsible groups,
-tags, colors, responsive technical details, config reload, warnings, help, and
-one-shot connection. Editing, favorites, recents, nested groups, persistent
-application state, SFTP, and an embedded SSH implementation are out of scope.
+The surface is one full-screen host list with fuzzy search, nested collapsible
+groups, tags, colors, host visibility annotations, responsive technical details,
+config reload, warnings, help, and one-shot connection. Editing, favorites,
+recents, persistent application state, SFTP, and an embedded SSH implementation
+are out of scope.
 
 Grouping metadata uses full-line `# porteiro:` comments in the SSH config.
 File defaults precede the first local Host/Match; Host annotations override
@@ -65,6 +66,10 @@ The `hidden=true` annotation excludes a host from the catalog UI only after
 reachability validation and deduplication; it cannot mask configuration errors
 or allow a later declaration to revive a hidden alias. It shares the same
 file-local scope as other metadata, and `hidden=false` clears a hidden default.
+Keep `group` a literal single-level name; `group_path` splits on `/`, trims each
+component and rejects empty components. Both replace the entire inherited path
+and cannot coexist on one annotation. Use full component paths for group
+identity so literal slashes and identically named subgroups cannot collide.
 
 ## Architecture
 
@@ -107,6 +112,10 @@ file-local scope as other metadata, and `hidden=false` clears a hidden default.
   expansion or catalog changes. Group selection must never resolve or connect
   an SSH destination. Search expansion is temporary; keep normal expansion in
   memory only. Retain Ratatui's table state across renders for stable scrolling.
+  Group counts include all descendant hosts. At each level, render subgroups
+  before directly assigned hosts, with cached tree connectors. Search opens
+  all matching ancestors; clipping deep indentation must preserve alias and
+  connection-verbosity readability.
 - `src/main.rs`: orchestration, terminal lifecycle, and exit status propagation.
 
 Keep side effects outside the synchronous key handler. Key handling should
