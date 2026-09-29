@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 const DETAIL_BREAKPOINT: u16 = 100;
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
@@ -45,21 +46,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect) {
+    // Reserve the version before optional branding. The embedded package
+    // version agrees with --version and identifies the running binary even
+    // when the checkout or installed executable has since been replaced.
+    let version_width = u16::try_from(VERSION_LABEL.len())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let [identity, version] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(version_width)]).areas(area);
+    let brand = " porteiro ";
+    let description = " OpenSSH config hosts";
+    let mut spans = Vec::with_capacity(2);
+    if usize::from(identity.width) >= brand.len() {
+        spans.push(Span::styled(
+            brand,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if usize::from(identity.width) >= brand.len() + description.len() {
+        spans.push(Span::raw(description));
+    }
+    let style = Style::default().fg(theme::HEADER_FG).bg(theme::HEADER_BG);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(style), identity);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " porteiro ",
-                Style::default()
-                    .fg(theme::HEADER_FG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " OpenSSH config hosts",
-                Style::default().fg(theme::HEADER_FG),
-            ),
-        ]))
-        .style(Style::default().bg(theme::HEADER_BG)),
-        area,
+        Paragraph::new(VERSION_LABEL).style(style.add_modifier(Modifier::BOLD)),
+        version,
     );
 }
 
@@ -255,6 +266,46 @@ mod tests {
         assert!(screen.contains("production") && screen.contains("staging"));
         assert!(!screen.contains("HostName"));
         assert!(!screen.contains("Details"));
+    }
+
+    #[test]
+    fn header_keeps_the_running_version_visible_when_space_is_tight() {
+        for width in [120, 40, 18, 12, VERSION_LABEL.len() as u16] {
+            let screen = rendered(&mut app(), width, 12);
+            let header = screen.lines().next().unwrap();
+            assert!(
+                header.ends_with(VERSION_LABEL),
+                "{width} columns: {header:?}"
+            );
+            if width < 40 {
+                assert!(!header.contains("OpenSSH config hosts"));
+            }
+        }
+    }
+
+    #[test]
+    fn overlays_leave_the_version_visible() {
+        let mut app = app();
+        app.show_help = true;
+        assert!(rendered(&mut app, 120, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(VERSION_LABEL));
+        app.show_help = false;
+        app.show_detail_overlay = true;
+        assert!(rendered(&mut app, 120, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(VERSION_LABEL));
+        app.show_detail_overlay = false;
+        app.show_warnings = true;
+        assert!(rendered(&mut app, 120, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(VERSION_LABEL));
     }
 
     #[test]

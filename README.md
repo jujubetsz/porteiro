@@ -12,7 +12,7 @@ credentials, implement the SSH protocol, probe hosts, or modify configuration
 files.
 
 ```text
- porteiro  OpenSSH config hosts
+ porteiro  OpenSSH config hosts                                                               v0.2.0
 ╭ Hosts - 2 shown / 2 total ─────────────────────────────────╮╭ Details ───────────────────────────╮
 │  Alias                  HostName                     Port  ││Alias        production             │
 │› production             prod.example.test            2222  ││HostName     prod.example.test      │
@@ -80,6 +80,11 @@ porteiro [--config PATH] [--ssh PATH]
 `--config` selects another user configuration file. The same path is passed to
 OpenSSH with `-F` for details and connections. `--ssh` selects another
 OpenSSH-compatible executable and is useful when `ssh` is not on `PATH`.
+
+The running binary's version is always shown at the top right, including in
+narrow terminals and while overlays are open. `porteiro --version` reports the
+same package version without opening the TUI or reading your SSH config. Both
+values are embedded from `Cargo.toml` when the binary is compiled.
 
 | Key | Action |
 | --- | --- |
