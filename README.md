@@ -36,7 +36,9 @@ files.
   declaration order, including target-dependent include paths.
 - Lists concrete `Host` aliases that can be passed to `ssh` literally, omitting
   wildcard, negated and otherwise invalid spellings.
-- Filters hosts with fuzzy search.
+- Organizes hosts into collapsible groups with optional tags and colors, using
+  comments in the SSH config.
+- Filters hosts with fuzzy search, including group names and tags.
 - Shows effective HostName, User, Port, ProxyJump, ProxyCommand and
   IdentityFile values from `ssh -G`.
 - Restores the terminal and launches `ssh` directly when you press `Enter`,
@@ -82,12 +84,14 @@ OpenSSH-compatible executable and is useful when `ssh` is not on `PATH`.
 | Key | Action |
 | --- | --- |
 | `j` / `k`, arrows | Move selection |
-| `PgUp` / `PgDn`, `Home` / `End` | Move by page, jump to first or last host |
+| `PgUp` / `PgDn`, `Home` / `End` | Move by page, jump to first or last row |
 | `/` | Focus search |
-| `Enter` | Accept search or connect |
+| `Enter` | Accept search, expand/collapse a group, or connect to a host |
+| `Space` | Expand/collapse the selected group |
 | `Esc` | Clear search or close an overlay |
 | `i` | Toggle the details overlay |
 | `r` | Reload the config |
+| `w` | View configuration warnings; `j`/`k` browse them, `Esc` closes |
 | `v` | Cycle the verbosity of the next connection: `-v`, `-vv`, `-vvv`, off |
 | `?` | Toggle help |
 | `q` / `Ctrl-C` | Quit |
@@ -99,6 +103,77 @@ leaving the list.
 Porteiro exits after the SSH session ends and returns the SSH process exit
 status to the calling shell. On Unix, a session terminated by a signal returns
 the conventional shell-visible status `128 + signal`.
+
+## Groups, tags and colors
+
+Add full-line `# porteiro:` comments to your SSH config or included files.
+These are Porteiro annotations, not SSH options. OpenSSH
+[ignores comment lines](https://man.openbsd.org/ssh_config#DESCRIPTION), so
+the same files continue to work with `ssh`, `scp` and `sftp`.
+
+```sshconfig
+# Defaults for hosts declared in this file
+# porteiro: group="Work" color=blue
+
+Host production
+    HostName prod.example.test
+    User deploy
+    # porteiro: tags=prod,api color=red
+
+Host staging
+    HostName staging.example.test
+    # porteiro: tags=staging,api
+
+Host personal
+    HostName home.example.test
+    # porteiro: group="Personal" tags=homelab color=green
+
+Host standalone
+    HostName standalone.example.test
+    # porteiro: group="" color=default
+```
+
+```text
+▸ Work (2)
+▾ Personal (1)
+    personal [homelab]
+  standalone
+```
+
+- Each host has at most one group and any number of comma-separated tags.
+  Quote names containing spaces. Group and tag names are case-sensitive;
+  search is case-insensitive. Repeated tags are shown once, in written order.
+- Annotations before the first `Host` or `Match` in a file set that file's
+  defaults. Inside a `Host` block they override fields for the concrete aliases
+  declared in that block. The last valid annotation for a field wins;
+  omitted fields retain their values. Tags replace, rather than append to,
+  inherited tags. Use `group=""`, `tags=""` or `color=default` to reset a field.
+- Defaults and block annotations stay in their own file. They do not flow
+  through `Include`, even when an included file contains only SSH options.
+  The first reachable declaration retained for an alias supplies its metadata;
+  later duplicate declarations do not overwrite it.
+- Annotations in `Match` blocks or blocks with no concrete aliases are ignored
+  with a warning. Annotations do not apply wildcard matching or evaluate
+  `Match` criteria. Inline comments after SSH options remain ordinary comments.
+- Colors are `red`, `yellow`, `green`, `blue`, `magenta`, `cyan`, `white`, `gray`
+  or `default`. They accent host names and tag text. A group's header uses the
+  color of its first retained host. Selection and labels remain visible without
+  relying on color.
+- Malformed annotations are ignored as a whole, with file and line diagnostics
+  available through `w`. Unknown keys/colors, duplicate keys on one line and
+  control/bidirectional formatting characters are rejected. Ordinary SSH
+  syntax and Include errors retain their existing handling.
+
+Groups start collapsed above ungrouped hosts. Groups follow their first
+appearance, and hosts within them retain declaration order. Search also matches
+group names and tags, temporarily opens matching groups and ranks matching hosts
+within each group. Clearing the query restores the previous expansion state.
+Reload preserves surviving expanded groups and the selected row when it remains
+visible; expansion is kept only for the current session.
+
+Tags share the alias column and give way to the alias and verbosity flag in
+narrow terminals. A `+N` marker reports hidden tags when space permits; `i` shows
+the full group and tag values in the details overlay.
 
 ## How host discovery works
 

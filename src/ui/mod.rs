@@ -1,5 +1,6 @@
 mod detail;
 mod host_list;
+mod list;
 mod shell;
 mod theme;
 
@@ -7,6 +8,8 @@ use crate::catalog::{Catalog, Host};
 use crate::ssh::{ResolvedHost, SshClient};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use list::{HostList, VisibleRow};
+use ratatui::widgets::TableState;
 use ratatui::DefaultTerminal;
 use std::collections::HashMap;
 
@@ -46,36 +49,50 @@ pub struct App {
     pub filter_focused: bool,
     pub show_help: bool,
     pub show_detail_overlay: bool,
+    pub show_warnings: bool,
+    pub warning_index: usize,
     pub verbosity: u8,
     pub status: Option<String>,
     details: HashMap<String, DetailState>,
+    list: HostList,
+    table_state: TableState,
 }
 
 impl App {
     fn new(catalog: Catalog) -> Self {
         Self {
+            list: HostList::new(&catalog),
             catalog,
             selected: 0,
             filter: String::new(),
             filter_focused: false,
             show_help: false,
             show_detail_overlay: false,
+            show_warnings: false,
+            warning_index: 0,
             verbosity: 0,
             status: None,
             details: HashMap::new(),
+            table_state: TableState::default(),
         }
     }
 
-    pub fn visible_indices(&self) -> Vec<usize> {
-        self.catalog.filtered_indices(&self.filter)
+    fn selected_row(&self) -> Option<VisibleRow> {
+        self.list.rows.get(self.selected).copied()
     }
 
     pub fn selected_host(&self) -> Option<&Host> {
-        let visible = self.visible_indices();
-        let selected = self.selected.min(visible.len().saturating_sub(1));
-        visible
-            .get(selected)
-            .and_then(|index| self.catalog.hosts().get(*index))
+        match self.selected_row()? {
+            VisibleRow::Host(index) => self.catalog.hosts().get(index),
+            VisibleRow::Group(_) => None,
+        }
+    }
+
+    fn selected_group(&self) -> Option<&list::Group> {
+        match self.selected_row()? {
+            VisibleRow::Group(index) => self.list.groups.get(index),
+            VisibleRow::Host(_) => None,
+        }
     }
 
     pub fn selected_detail(&self) -> Option<&DetailState> {
@@ -93,7 +110,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) -> Option<Action> {
-        let length = self.visible_indices().len();
+        let length = self.list.rows.len();
         if length == 0 {
             self.selected = 0;
             return None;
@@ -103,7 +120,7 @@ impl App {
     }
 
     fn move_page(&mut self, delta: isize) -> Option<Action> {
-        let length = self.visible_indices().len();
+        let length = self.list.rows.len();
         if length == 0 {
             self.selected = 0;
             return None;
@@ -134,6 +151,20 @@ impl App {
             }
             return None;
         }
+        if self.show_warnings {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('w') => self.show_warnings = false,
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Right => {
+                    self.warning_index = (self.warning_index + 1)
+                        .min(self.catalog.warnings().len().saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::Left => {
+                    self.warning_index = self.warning_index.saturating_sub(1);
+                }
+                _ => {}
+            }
+            return None;
+        }
         if self.show_detail_overlay {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('i')) {
                 self.show_detail_overlay = false;
@@ -154,6 +185,11 @@ impl App {
                 self.show_detail_overlay = true;
                 None
             }
+            KeyCode::Char('w') => {
+                self.show_warnings = true;
+                self.warning_index = 0;
+                None
+            }
             KeyCode::Char('/') => {
                 self.filter_focused = true;
                 None
@@ -167,7 +203,7 @@ impl App {
                 self.resolve_action()
             }
             KeyCode::End => {
-                self.selected = self.visible_indices().len().saturating_sub(1);
+                self.selected = self.list.rows.len().saturating_sub(1);
                 self.resolve_action()
             }
             KeyCode::Char('r') => Some(Action::Reload),
@@ -175,10 +211,16 @@ impl App {
                 self.verbosity = (self.verbosity + 1) % VERBOSITY_LEVELS;
                 None
             }
+            KeyCode::Char(' ') | KeyCode::Enter if self.selected_group().is_some() => {
+                if let Some(VisibleRow::Group(index)) = self.selected_row() {
+                    self.list.toggle(index);
+                }
+                None
+            }
             KeyCode::Enter => self.selected_alias().map(Action::Connect),
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                self.selected = 0;
+                self.refresh_filter();
                 self.resolve_action()
             }
             _ => None,
@@ -190,12 +232,13 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.filter_focused = false;
-                self.selected = 0;
             }
-            KeyCode::Enter => self.filter_focused = false,
+            KeyCode::Enter => {
+                self.filter_focused = false;
+                return self.resolve_action();
+            }
             KeyCode::Backspace => {
                 self.filter.pop();
-                self.selected = 0;
             }
             KeyCode::Char(character)
                 if !key
@@ -203,11 +246,25 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.filter.push(character);
-                self.selected = 0;
             }
             _ => return None,
         }
+        self.refresh_filter();
         self.resolve_action()
+    }
+
+    fn refresh_filter(&mut self) {
+        self.list.filter(&self.catalog, &self.filter);
+        self.selected = if self.filter.trim().is_empty() {
+            0
+        } else {
+            self.list
+                .rows
+                .iter()
+                .position(|row| matches!(row, VisibleRow::Host(_)))
+                .unwrap_or(0)
+        };
+        self.table_state = TableState::default();
     }
 
     fn set_detail(&mut self, alias: String, detail: Result<ResolvedHost>) {
@@ -219,8 +276,26 @@ impl App {
     }
 
     fn replace_catalog(&mut self, catalog: Catalog) {
+        let selected_alias = self.selected_alias().map(|alias| alias.to_lowercase());
+        let selected_group = self.selected_group().map(|group| group.name.clone());
+        let mut list = HostList::new(&catalog);
+        list.restore_expansion(&self.list);
+        list.filter(&catalog, &self.filter);
+        self.selected = list
+            .rows
+            .iter()
+            .position(|row| match row {
+                VisibleRow::Host(index) => selected_alias
+                    .as_ref()
+                    .is_some_and(|alias| catalog.hosts()[*index].alias.to_lowercase() == *alias),
+                VisibleRow::Group(index) => {
+                    selected_group.as_ref() == Some(&list.groups[*index].name)
+                }
+            })
+            .unwrap_or(0);
+        self.list = list;
         self.catalog = catalog;
-        self.selected = 0;
+        self.table_state = TableState::default();
         self.details.clear();
     }
 }
@@ -230,7 +305,7 @@ pub fn run(mut terminal: DefaultTerminal, catalog: Catalog, ssh: &SshClient) -> 
     resolve_selected(&mut app, ssh);
 
     loop {
-        terminal.draw(|frame| shell::render(frame, &app))?;
+        terminal.draw(|frame| shell::render(frame, &mut app))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -290,6 +365,7 @@ mod tests {
                 hostname: Some(hostname.into()),
                 ..HostHints::default()
             },
+            metadata: Default::default(),
         }
     }
 
@@ -302,6 +378,174 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn grouped_app() -> App {
+        let mut api = host("api", "api.internal");
+        api.metadata.group = Some("Work".into());
+        api.metadata.tags = vec!["critical".into()];
+        let mut backup = host("backup", "backup.internal");
+        backup.metadata.group = Some("Personal".into());
+        let mut staging = host("staging", "staging.internal");
+        staging.metadata.group = Some("Work".into());
+        App::new(Catalog::from_hosts_for_test(vec![
+            host("standalone", "localhost"),
+            api,
+            backup,
+            staging,
+        ]))
+    }
+
+    #[test]
+    fn groups_start_collapsed_in_declaration_order_above_ungrouped_hosts() {
+        let mut app = grouped_app();
+        assert_eq!(
+            app.list.rows,
+            [
+                VisibleRow::Group(0),
+                VisibleRow::Group(1),
+                VisibleRow::Host(0)
+            ]
+        );
+        assert_eq!(app.selected_group().unwrap().name, "Work");
+        assert!(app.selected_host().is_none());
+        assert!(app.resolve_action().is_none());
+        app.handle_key(press(KeyCode::Char('i')));
+        assert!(!app.show_detail_overlay);
+
+        assert_eq!(app.handle_key(press(KeyCode::Char(' '))), None);
+        assert_eq!(
+            app.list.rows,
+            [
+                VisibleRow::Group(0),
+                VisibleRow::Host(1),
+                VisibleRow::Host(3),
+                VisibleRow::Group(1),
+                VisibleRow::Host(0)
+            ]
+        );
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+        assert_eq!(app.list.rows.len(), 3);
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.handle_key(press(KeyCode::Down)),
+            Some(Action::Resolve("api".into()))
+        );
+        assert_eq!(app.handle_key(press(KeyCode::Char(' '))), None);
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter)),
+            Some(Action::Connect("api".into()))
+        );
+    }
+
+    #[test]
+    fn navigation_skips_collapsed_children_and_wraps_without_resolving_groups() {
+        let mut app = grouped_app();
+        assert_eq!(app.handle_key(press(KeyCode::Down)), None);
+        assert_eq!(app.selected_group().unwrap().name, "Personal");
+        assert_eq!(
+            app.handle_key(press(KeyCode::Down)),
+            Some(Action::Resolve("standalone".into()))
+        );
+        assert_eq!(app.handle_key(press(KeyCode::Down)), None);
+        assert_eq!(app.selected_group().unwrap().name, "Work");
+        assert_eq!(
+            app.handle_key(press(KeyCode::End)),
+            Some(Action::Resolve("standalone".into()))
+        );
+        assert_eq!(app.handle_key(press(KeyCode::Home)), None);
+    }
+
+    #[test]
+    fn search_reveals_matches_and_restores_expansion_even_after_toggling_search_groups() {
+        let mut app = grouped_app();
+        app.handle_key(press(KeyCode::Char(' '))); // Work stays open after searching.
+        app.handle_key(press(KeyCode::Char('/')));
+        for character in "backup".chars() {
+            app.handle_key(press(KeyCode::Char(character)));
+        }
+        assert_eq!(app.selected_host().unwrap().alias, "backup");
+        assert_eq!(app.list.rows, [VisibleRow::Group(1), VisibleRow::Host(2)]);
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(press(KeyCode::Home));
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(app.list.rows, [VisibleRow::Group(1)]);
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.list.is_expanded(0));
+        assert!(!app.list.is_expanded(1));
+        assert_eq!(app.list.shown_hosts, 3);
+    }
+
+    #[test]
+    fn search_matches_group_names_and_tags_and_space_remains_search_text() {
+        let mut app = grouped_app();
+        app.filter = "critical".into();
+        app.refresh_filter();
+        assert_eq!(app.selected_host().unwrap().alias, "api");
+        assert_eq!(app.list.shown_hosts, 1);
+        app.filter = "Work".into();
+        app.refresh_filter();
+        assert_eq!(app.list.shown_hosts, 2);
+        app.filter_focused = true;
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(app.filter, "Work ");
+        assert!(app.list.is_expanded(0));
+        app.filter = "does-not-exist".into();
+        app.refresh_filter();
+        assert!(app.list.rows.is_empty());
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn reload_preserves_known_groups_and_selection_and_removes_stale_rows() {
+        let mut app = grouped_app();
+        app.handle_key(press(KeyCode::Char(' ')));
+        app.handle_key(press(KeyCode::Down));
+        app.details
+            .insert("api".into(), DetailState::Failed("old".into()));
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts.swap(1, 2); // Group indices can change after reload.
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        assert_eq!(app.selected_host().unwrap().alias, "api");
+        assert!(app.selected_detail().is_none());
+        assert!(!app.list.is_expanded(0));
+        assert!(app.list.is_expanded(1));
+
+        app.replace_catalog(Catalog::from_hosts_for_test(vec![]));
+        assert!(app.selected_host().is_none());
+        assert_eq!(app.handle_key(press(KeyCode::Down)), None);
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn warning_overlay_consumes_connection_keys_and_closes_with_escape() {
+        let mut app = app();
+        app.handle_key(press(KeyCode::Char('w')));
+        assert!(app.show_warnings);
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.warning_index, 0);
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.show_warnings);
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter)),
+            Some(Action::Connect("production".into()))
+        );
+    }
+
+    #[test]
+    fn reload_uses_the_catalogs_case_insensitive_alias_identity() {
+        let mut app = App::new(Catalog::from_hosts_for_test(vec![
+            host("before", "localhost"),
+            host("Ápi", "api.internal"),
+        ]));
+        app.selected = 1;
+        app.replace_catalog(Catalog::from_hosts_for_test(vec![
+            host("before", "localhost"),
+            host("áPI", "api.internal"),
+        ]));
+        assert_eq!(app.selected_host().unwrap().alias, "áPI");
     }
 
     #[test]

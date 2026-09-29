@@ -1,0 +1,20 @@
+# porteiro: group="Work" color=blue
+
+Host production
+  HostName prod.example.test
+  User deploy
+  Port 2222
+  # porteiro: tags=prod,api color=red
+
+Host staging
+  HostName staging.example.test
+  User deploy
+  # porteiro: tags=staging,api
+
+Host personal
+  HostName home.example.test
+  # porteiro: group="Personal" tags=homelab color=green
+
+Host standalone
+  HostName standalone.example.test
+  # porteiro: group="" color=default

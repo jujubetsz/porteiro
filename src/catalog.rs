@@ -1,3 +1,7 @@
+mod metadata;
+
+pub use metadata::{AccentColor, HostMetadata};
+
 use glob::{glob_with, MatchOptions, Pattern};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -25,6 +29,7 @@ pub struct Host {
     pub source: PathBuf,
     pub line: usize,
     pub hints: HostHints,
+    pub metadata: HostMetadata,
 }
 
 impl Host {
@@ -35,8 +40,10 @@ impl Host {
             self.hints.user.as_deref().unwrap_or_default(),
             self.hints.port.as_deref().unwrap_or_default(),
             self.hints.proxy_jump.as_deref().unwrap_or_default(),
+            self.metadata.group.as_deref().unwrap_or_default(),
         ]
         .into_iter()
+        .chain(self.metadata.tags.iter().map(String::as_str))
         .filter_map(|candidate| fuzzy_score(query, candidate))
         .max()
     }
@@ -346,24 +353,55 @@ impl Builder {
         include_chain: &mut Vec<IncludeHop>,
     ) -> Result<(), CatalogError> {
         let contents = read_config_contents(path, is_include, self.local_uid)?;
+        let mut defaults = HostMetadata::default();
+        // Annotation scope is lexical and file-local, unlike OpenSSH's options:
+        // Includes cannot inherit defaults or redirect a parent's annotations.
+        let mut metadata_hosts: Option<Vec<usize>> = None;
 
         for (line_index, raw_line) in contents.lines().enumerate() {
             let line = line_index + 1;
+            if let Some(annotation) = metadata::parse(raw_line) {
+                match annotation {
+                    Ok(annotation) => match &metadata_hosts {
+                        None => annotation.apply(&mut defaults),
+                        Some(indices) if !indices.is_empty() => {
+                            for index in indices {
+                                annotation.apply(&mut self.hosts[*index].metadata);
+                            }
+                        }
+                        Some(_) => self.warn_once(format!(
+                            "{}:{line}: ignored porteiro annotation: no concrete Host aliases in this block",
+                            path.display()
+                        )),
+                    },
+                    Err(error) => self.warn_once(format!(
+                        "{}:{line}: ignored porteiro annotation: {error}", path.display()
+                    )),
+                }
+                continue;
+            }
             let Some(directive) = parse_directive(raw_line).map_err(syntax(path, line))? else {
                 continue;
             };
 
             let arguments = &directive.arguments;
             match directive.keyword.as_str() {
-                "host" => self.start_host_block(
-                    path,
-                    line,
-                    arguments,
-                    active_hosts,
-                    has_unknown_host,
-                    include_chain,
-                ),
+                "host" => {
+                    self.start_host_block(
+                        path,
+                        line,
+                        arguments,
+                        active_hosts,
+                        has_unknown_host,
+                        include_chain,
+                    );
+                    for index in active_hosts.iter() {
+                        self.hosts[*index].metadata.clone_from(&defaults);
+                    }
+                    metadata_hosts = Some(active_hosts.clone());
+                }
                 "match" => {
+                    metadata_hosts = Some(Vec::new());
                     active_hosts.clear();
                     *has_unknown_host = false;
                 }
@@ -453,6 +491,7 @@ impl Builder {
                 source: source.to_path_buf(),
                 line,
                 hints: HostHints::default(),
+                metadata: HostMetadata::default(),
             });
             self.host_origins.push(DeclarationOrigin {
                 include_chain: include_chain.to_vec(),
@@ -2373,6 +2412,144 @@ mod tests {
     }
 
     #[test]
+    fn metadata_defaults_apply_to_concrete_declarations_and_hosts_can_override_or_clear_them() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            r#"
+# porteiro: group="Work Team" tags=company color=blue
+Host api api-alt *.internal !excluded excluded
+    # porteiro: tags=prod,api color=red
+Host staging
+Host personal
+    # porteiro: group="Personal" tags=home
+Host standalone
+    # porteiro: group="" tags= color=default
+Host API
+    # porteiro: group="Duplicate must not win"
+"#,
+        );
+        let catalog = fixture.load().unwrap();
+        assert!(catalog.warnings().is_empty());
+        assert_eq!(
+            aliases(&catalog),
+            ["api", "api-alt", "staging", "personal", "standalone"]
+        );
+        let hosts = catalog.hosts();
+        assert_eq!(hosts[0].metadata, hosts[1].metadata);
+        assert_eq!(hosts[0].metadata.group.as_deref(), Some("Work Team"));
+        assert_eq!(hosts[0].metadata.tags, ["prod", "api"]);
+        assert_eq!(hosts[0].metadata.color, Some(AccentColor::Red));
+        assert_eq!(hosts[2].metadata.tags, ["company"]);
+        assert_eq!(hosts[2].metadata.color, Some(AccentColor::Blue));
+        assert_eq!(hosts[3].metadata.group.as_deref(), Some("Personal"));
+        assert_eq!(hosts[4].metadata, HostMetadata::default());
+        assert_eq!(catalog.filtered_indices("Work Team").len(), 3);
+        assert_eq!(catalog.filtered_indices("prod"), [0, 1]);
+    }
+
+    #[test]
+    fn annotation_scope_stays_in_its_file_across_includes() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            r#"
+# porteiro: group=Root color=blue
+Include conf.d/*.conf missing.conf
+Host parent
+    Include options.conf
+    # porteiro: tags=parent
+Host sibling
+"#,
+        );
+        fixture.write(
+            ".ssh/conf.d/a.conf",
+            "# porteiro: group=Child\nHost child\n  # porteiro: tags=child\n",
+        );
+        fixture.write(".ssh/conf.d/b.conf", "Host plain\n");
+        fixture.write(
+            ".ssh/options.conf",
+            "# porteiro: group=MustNotLeak color=red\nUser deploy\n",
+        );
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["child", "plain", "parent", "sibling"]);
+        let hosts = catalog.hosts();
+        assert_eq!(hosts[0].metadata.group.as_deref(), Some("Child"));
+        assert_eq!(hosts[0].metadata.color, None);
+        assert_eq!(hosts[1].metadata, HostMetadata::default());
+        assert_eq!(hosts[2].metadata.group.as_deref(), Some("Root"));
+        assert_eq!(hosts[2].metadata.color, Some(AccentColor::Blue));
+        assert_eq!(hosts[2].metadata.tags, ["parent"]);
+        assert_eq!(hosts[2].hints.user.as_deref(), Some("deploy"));
+        assert!(hosts[3].metadata.tags.is_empty());
+    }
+
+    #[test]
+    fn annotations_cannot_make_conditional_aliases_reachable_or_override_the_selected_origin() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "Host gate\nInclude conditional.conf\nHost *\nInclude global.conf\n",
+        );
+        fixture.write(
+            ".ssh/conditional.conf",
+            "# porteiro: group=Unreachable\nHost duplicate hidden\n",
+        );
+        fixture.write(
+            ".ssh/global.conf",
+            "# porteiro: group=Reachable\nHost duplicate\n",
+        );
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["gate", "duplicate"]);
+        assert_eq!(
+            catalog.hosts()[1].metadata.group.as_deref(),
+            Some("Reachable")
+        );
+    }
+
+    #[test]
+    fn annotation_failures_warn_with_source_without_partially_updating_metadata() {
+        let fixture = Fixture::new();
+        fixture.write(".ssh/config", "# porteiro: group=Work\nHost api\n# porteiro: group=Wrong color=invalid\nHost *\n# porteiro: tags=ignored\nMatch all\n# porteiro: group=ignored\nHost other # porteiro: group=inline-is-not-metadata\n");
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["api", "other"]);
+        assert!(catalog
+            .hosts()
+            .iter()
+            .all(|host| host.metadata.group.as_deref() == Some("Work")));
+        assert_eq!(catalog.warnings().len(), 3);
+        assert!(catalog.warnings()[0].contains("config:3: ignored porteiro annotation"));
+        assert!(catalog.warnings()[0].contains("unknown color"));
+        assert!(catalog.warnings()[1].contains("config:5:"));
+        assert!(catalog.warnings()[2].contains("config:7:"));
+    }
+
+    #[test]
+    fn annotations_do_not_mask_include_cycles_or_execute_match_criteria() {
+        let fixture = Fixture::new();
+        let marker = fixture.home().join("must-not-exist");
+        fixture.write(".ssh/config", &format!(
+            "# porteiro: group=Root\nMatch exec \"touch {}\"\nInclude hidden.conf\nHost visible\n# porteiro: tags=safe\n", marker.display()
+        ));
+        fixture.write(
+            ".ssh/hidden.conf",
+            "# porteiro: group=Hidden\nHost hidden\n",
+        );
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["visible"]);
+        assert!(!marker.exists());
+        fixture.write(
+            ".ssh/config",
+            "# porteiro: group=Root\nInclude cycle.conf\nHost api\n",
+        );
+        fixture.write(
+            ".ssh/cycle.conf",
+            "# porteiro: group=Cycle\nInclude config\n",
+        );
+        assert!(fixture.load().unwrap_err().to_string().contains("cycle"));
+    }
+
+    #[test]
     fn discovers_concrete_hosts_with_hints_in_declaration_order() {
         let fixture = Fixture::new();
         fixture.write(
@@ -2567,6 +2744,7 @@ Host staging
                 port: Some("2200".to_string()),
                 ..HostHints::default()
             },
+            metadata: HostMetadata::default(),
         });
         builder.update_proxy(&[0], |proxy| proxy.set_jump(Truth::Yes, "jump", "jump"));
         builder.host_key_aliases.insert(0, "key-alias".to_string());

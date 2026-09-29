@@ -47,10 +47,18 @@ standard SSH terminology without extending the name into a metaphor.
 
 ## Current scope
 
-The v0.1 surface is one full-screen host list with fuzzy search, responsive
-technical details, config reload, help, and one-shot connection. Editing,
-favorites, recents, grouping, persistent application state, SFTP, and an
-embedded SSH implementation are out of scope.
+The surface is one full-screen host list with fuzzy search, collapsible groups,
+tags, colors, responsive technical details, config reload, warnings, help, and
+one-shot connection. Editing, favorites, recents, nested groups, persistent
+application state, SFTP, and an embedded SSH implementation are out of scope.
+
+Grouping metadata uses full-line `# porteiro:` comments in the SSH config.
+File defaults precede the first local Host/Match; Host annotations override
+them only for concrete aliases declared in that local block. Metadata never
+flows through Include or participates in SSH matching. Keep metadata from the
+retained reachable declaration, not an earlier conservative candidate. Invalid
+annotations warn with file/line and apply no partial update. Reject control and
+bidirectional formatting characters in metadata displayed by the terminal.
 
 ## Architecture
 
@@ -86,8 +94,13 @@ embedded SSH implementation are out of scope.
   percent tokens and a trailing `%` are fatal syntax errors, while expansion
   failures that OpenSSH ignores, such as an unset environment variable, remain
   warnings.
+- `src/catalog/metadata.rs`: atomic parsing of optional presentation annotations.
 - `src/ssh.rs`: effective-config resolution and direct OpenSSH process launch.
 - `src/ui/`: state machine, rendering, key handling, and terminal event loop.
+  `list.rs` caches the grouped projection; rebuild it only when the filter,
+  expansion or catalog changes. Group selection must never resolve or connect
+  an SSH destination. Search expansion is temporary; keep normal expansion in
+  memory only. Retain Ratatui's table state across renders for stable scrolling.
 - `src/main.rs`: orchestration, terminal lifecycle, and exit status propagation.
 
 Keep side effects outside the synchronous key handler. Key handling should
@@ -98,9 +111,11 @@ logic testable without a real terminal or network.
 
 - `j`/`k` or arrows: move selection.
 - `/`: focus search; `Enter` accepts it and `Esc` clears it.
-- `Enter`: connect to the selected alias.
+- `Enter`: connect to the selected alias or expand/collapse the selected group.
+- `Space`: expand/collapse the selected group (ordinary text in search).
 - `i`: open technical details as an overlay.
 - `r`: reload the SSH config.
+- `w`: inspect configuration warnings; `j`/`k` browse and `Esc` closes.
 - `v`: cycle the `-v` verbosity of the next connection (off, 1, 2, 3). The
   selected row shows the flag as a badge, the `Enter` hint and status line
   repeat it, and `Enter` passes it as argv items.
