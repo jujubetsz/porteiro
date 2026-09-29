@@ -1,9 +1,12 @@
-use super::{theme, App};
+use super::{
+    list::{Group, VisibleRow},
+    theme, App,
+};
 use crate::catalog::Host;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,11 +80,11 @@ fn visible_columns(area_width: u16) -> Vec<Column> {
         .collect()
 }
 
-pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let visible = app.visible_indices();
+pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+    let visible = &app.list.rows;
     let title = format!(
         " Hosts - {} shown / {} total ",
-        visible.len(),
+        app.list.shown_hosts,
         app.catalog.hosts().len()
     );
     let block = panel(&title);
@@ -114,12 +117,37 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     );
     let selected = app.selected.min(visible.len().saturating_sub(1));
     let badge = app.verbosity_flag();
-    let rows = visible.iter().enumerate().filter_map(|(position, index)| {
-        let host = app.catalog.hosts().get(*index)?;
-        let is_selected = position == selected;
-        let badge = badge.as_deref().filter(|_| is_selected);
-        Some(row(host, &columns, is_selected, badge))
-    });
+    let alias_width = area.width.saturating_sub(
+        2 + columns.len().saturating_sub(1) as u16
+            + columns
+                .iter()
+                .filter(|column| **column != Column::Alias)
+                .map(|column| column.width())
+                .sum::<u16>(),
+    );
+    let rows: Vec<_> = visible
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| {
+            let is_selected = position == selected;
+            match *entry {
+                VisibleRow::Host(index) => row(
+                    &app.catalog.hosts()[index],
+                    &columns,
+                    is_selected,
+                    badge.as_deref().filter(|_| is_selected),
+                    usize::from(alias_width),
+                ),
+                VisibleRow::Group(index) => group_row(
+                    &app.list.groups[index],
+                    app.list.is_expanded(index),
+                    &columns,
+                    is_selected,
+                    usize::from(alias_width),
+                ),
+            }
+        })
+        .collect();
     // The selected row is styled here rather than through the table's
     // highlight style, which would paint over the verbosity badge.
     let table = Table::new(
@@ -132,17 +160,54 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     .header(header)
     .block(block)
     .column_spacing(1);
-    let mut state = TableState::default();
-    state.select(Some(selected));
-    frame.render_stateful_widget(table, area, &mut state);
+    // Ratatui updates the offset while rendering. Retaining that state avoids
+    // snapping the viewport back to the top on every navigation event.
+    app.table_state.select(Some(selected));
+    frame.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn row(host: &Host, columns: &[Column], selected: bool, badge: Option<&str>) -> Row<'static> {
+fn group_row(
+    group: &Group,
+    expanded: bool,
+    columns: &[Column],
+    selected: bool,
+    width: usize,
+) -> Row<'static> {
+    let marker = if expanded { "▾" } else { "▸" };
+    let count = if group.matches.len() == group.total {
+        group.total.to_string()
+    } else {
+        format!("{}/{}", group.matches.len(), group.total)
+    };
+    let name = truncate_label(&group.name, width.saturating_sub(count.len() + 5));
+    let cells = columns
+        .iter()
+        .map(|column| match column {
+            Column::Marker => Cell::from(if selected { "›" } else { " " }),
+            Column::Alias => Cell::from(Span::styled(
+                format!("{marker} {name} ({count})"),
+                Style::default()
+                    .fg(theme::accent(group.color))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            _ => Cell::from(""),
+        })
+        .collect::<Vec<_>>();
+    Row::new(cells).style(row_style(selected))
+}
+
+fn row(
+    host: &Host,
+    columns: &[Column],
+    selected: bool,
+    badge: Option<&str>,
+    alias_width: usize,
+) -> Row<'static> {
     let cells: Vec<Cell> = columns
         .iter()
         .map(|column| match column {
             Column::Marker => Cell::from(if selected { "›" } else { " " }),
-            Column::Alias => Cell::from(alias_line(&host.alias, badge)),
+            Column::Alias => Cell::from(alias_line(host, badge, alias_width)),
             Column::Hostname => {
                 Cell::from(host.hints.hostname.clone().unwrap_or_else(|| "-".into()))
             }
@@ -151,18 +216,32 @@ fn row(host: &Host, columns: &[Column], selected: bool, badge: Option<&str>) -> 
             Column::Source => Cell::from(source_label(host)),
         })
         .collect();
+    Row::new(cells).style(row_style(selected))
+}
+
+fn row_style(selected: bool) -> Style {
     let mut style = Style::default().fg(theme::TEXT);
     if selected {
         style = style.bg(theme::SELECT_BG).add_modifier(Modifier::BOLD);
     }
-    Row::new(cells).style(style)
+    style
 }
 
-/// The alias, followed by an inverted badge with the pending `-v` flag.
-fn alias_line(alias: &str, badge: Option<&str>) -> Line<'static> {
+/// Optional tags use only the space left after the alias and connection flag.
+/// Measure terminal cells (including wide Unicode), not UTF-8 bytes.
+fn alias_line(host: &Host, badge: Option<&str>, width: usize) -> Line<'static> {
+    let indent = if host.metadata.group.is_some() {
+        "  "
+    } else {
+        ""
+    };
+    // Reserve the connection flag before optional tags or a long alias. Below
+    // the minimum useful width, the status line still reports the pending flag.
+    let badge = badge.filter(|flag| width >= flag.len() + 6);
+    let alias_width = width.saturating_sub(badge.map_or(0, |flag| flag.len() + 4));
     let mut spans = vec![Span::styled(
-        alias.to_string(),
-        Style::default().fg(theme::IDENT),
+        truncate_label(&format!("{indent}{}", host.alias), alias_width),
+        Style::default().fg(theme::accent(host.metadata.color)),
     )];
     if let Some(flag) = badge {
         spans.push(Span::raw("  "));
@@ -174,7 +253,55 @@ fn alias_line(alias: &str, badge: Option<&str>) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    let mut used: usize = spans.iter().map(Span::width).sum();
+    for (index, tag) in host.metadata.tags.iter().enumerate() {
+        let label = format!(" [{tag}]");
+        let label_width = Span::raw(&label).width();
+        let remaining = host.metadata.tags.len() - index - 1;
+        let suffix = if remaining > 0 {
+            format!(" +{remaining}")
+        } else {
+            String::new()
+        };
+        if used + label_width + suffix.len() > width {
+            let overflow = format!(" +{}", remaining + 1);
+            if used + overflow.len() <= width {
+                spans.push(Span::styled(overflow, Style::default().fg(theme::MUTED)));
+            }
+            break;
+        }
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(theme::accent(host.metadata.color)),
+        ));
+        used += label_width;
+    }
     Line::from(spans)
+}
+
+/// Keep grapheme clusters intact: truncating by bytes or scalar values can cut
+/// an accented letter or an emoji sequence in half. Ratatui's own measurement
+/// gives the same cell widths that its renderer uses.
+fn truncate_label(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let span = Span::raw(value);
+    if span.width() <= width {
+        return value.to_string();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in span.styled_graphemes(Style::default()) {
+        let cells = Span::raw(grapheme.symbol).width();
+        if used + cells > width - 1 {
+            break;
+        }
+        result.push_str(grapheme.symbol);
+        used += cells;
+    }
+    result.push('…');
+    result
 }
 
 fn source_label(host: &Host) -> String {
@@ -216,5 +343,34 @@ mod tests {
         assert!(!columns.contains(&Column::Source));
         assert_eq!(columns[0], Column::Marker);
         assert_eq!(columns[1], Column::Alias);
+    }
+
+    #[test]
+    fn long_aliases_leave_space_for_the_connection_flag_before_tags() {
+        let host = Host {
+            alias: "a-very-long-production-alias".into(),
+            source: "config".into(),
+            line: 1,
+            hints: Default::default(),
+            metadata: crate::catalog::HostMetadata {
+                group: Some("Work".into()),
+                tags: vec!["production".into()],
+                color: None,
+            },
+        };
+        let line = alias_line(&host, Some("-vvv"), 20);
+        assert!(line.to_string().contains('…'));
+        assert!(line.to_string().ends_with(" -vvv "));
+        assert!(!line.to_string().contains("[production]"));
+        assert_eq!(line.width(), 20);
+        assert!(alias_line(&host, Some("-vvv"), 3).width() <= 3);
+    }
+
+    #[test]
+    fn truncation_respects_wide_characters_and_combining_graphemes() {
+        assert_eq!(truncate_label("東京", 4), "東京");
+        assert_eq!(truncate_label("東京", 3), "東…");
+        assert_eq!(truncate_label("e\u{301}xyz", 3), "e\u{301}x…");
+        assert_eq!(truncate_label("東京", 0), "");
     }
 }

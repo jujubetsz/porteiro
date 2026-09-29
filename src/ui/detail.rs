@@ -34,6 +34,15 @@ fn details_paragraph(app: &App, title: &'static str) -> Paragraph<'static> {
 }
 
 fn lines(app: &App) -> Vec<Line<'static>> {
+    if let Some(group) = app.selected_group() {
+        return vec![
+            field("Group", group.name.clone()),
+            field("Hosts", group.total.to_string()),
+            field("Matches", group.matches.len().to_string()),
+            Line::from(""),
+            Line::from("Space or Enter to expand / collapse."),
+        ];
+    }
     let Some(host) = app.selected_host() else {
         return vec![Line::from(Span::styled(
             "No host selected.",
@@ -42,6 +51,12 @@ fn lines(app: &App) -> Vec<Line<'static>> {
     };
 
     let mut lines = vec![field("Alias", host.alias.clone())];
+    if let Some(group) = &host.metadata.group {
+        lines.push(field("Group", group.clone()));
+    }
+    if !host.metadata.tags.is_empty() {
+        lines.push(field("Tags", host.metadata.tags.join(", ")));
+    }
     match app.selected_detail() {
         Some(DetailState::Ready(detail)) => {
             lines.push(field("HostName", detail.hostname.clone()));

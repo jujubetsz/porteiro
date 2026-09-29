@@ -15,6 +15,23 @@ fn help_describes_the_primary_options() {
 }
 
 #[test]
+fn version_identifies_the_binary_without_loading_the_ssh_config() {
+    let temp = TempDir::new().unwrap();
+    let output = porteiro()
+        .arg("--config")
+        .arg(temp.path().join("missing"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!("porteiro ", env!("CARGO_PKG_VERSION"), "\n")
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn missing_config_exits_with_an_actionable_error() {
     let temp = TempDir::new().unwrap();
     let output = porteiro()

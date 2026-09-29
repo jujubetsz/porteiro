@@ -2,12 +2,13 @@ use super::{detail, host_list, theme, App};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 const DETAIL_BREAKPOINT: u16 = 100;
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Block::default().style(Style::default().bg(theme::BG).fg(theme::TEXT)),
         frame.area(),
@@ -39,31 +40,44 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.show_help {
         render_help(frame);
     }
+    if app.show_warnings {
+        render_warnings(frame, app);
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect) {
+    // Reserve the version before optional branding. The embedded package
+    // version agrees with --version and identifies the running binary even
+    // when the checkout or installed executable has since been replaced.
+    let version_width = u16::try_from(VERSION_LABEL.len())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let [identity, version] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(version_width)]).areas(area);
+    let brand = " porteiro ";
+    let description = " OpenSSH config hosts";
+    let mut spans = Vec::with_capacity(2);
+    if usize::from(identity.width) >= brand.len() {
+        spans.push(Span::styled(
+            brand,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if usize::from(identity.width) >= brand.len() + description.len() {
+        spans.push(Span::raw(description));
+    }
+    let style = Style::default().fg(theme::HEADER_FG).bg(theme::HEADER_BG);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(style), identity);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " porteiro ",
-                Style::default()
-                    .fg(theme::HEADER_FG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " OpenSSH config hosts",
-                Style::default().fg(theme::HEADER_FG),
-            ),
-        ]))
-        .style(Style::default().bg(theme::HEADER_BG)),
-        area,
+        Paragraph::new(VERSION_LABEL).style(style.add_modifier(Modifier::BOLD)),
+        version,
     );
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let warning = match app.catalog.warnings().len() {
         0 => String::new(),
-        count => format!(" | {count} warning(s)"),
+        count => format!(" | {count} warning(s) [w]"),
     };
     let context = if app.filter_focused {
         format!("search: {}_", app.filter)
@@ -92,17 +106,23 @@ fn render_hints(frame: &mut Frame, app: &App, area: Rect) {
     let line = if app.filter_focused {
         Line::from(" type to search   Enter accept   Esc clear")
     } else {
-        let mut spans = vec![Span::raw(" j/k move  / search  Enter connect")];
-        if let Some(flag) = app.verbosity_flag() {
-            spans.push(Span::styled(
-                format!(" {flag}"),
-                Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let mut spans = vec![Span::raw(if app.selected_group().is_some() {
+            " j/k move  Space/Enter expand/collapse  / search"
+        } else {
+            " j/k move  / search  Enter connect"
+        })];
+        if app.selected_host().is_some() {
+            if let Some(flag) = app.verbosity_flag() {
+                spans.push(Span::styled(
+                    format!(" {flag}"),
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
         }
         spans.push(Span::raw(
-            "  i details  r reload  v verbose  ? help  q quit",
+            "  i details  r reload  v verbose  w warnings  ? help  q quit",
         ));
         Line::from(spans)
     };
@@ -113,17 +133,19 @@ fn render_hints(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame) {
-    let area = centered(frame.area(), 60, 17);
+    let area = centered(frame.area(), 62, 18);
     frame.render_widget(Clear, area);
     let help = Paragraph::new(vec![
         Line::from("j / k, arrows    move selection"),
         Line::from("PgUp / PgDn      move by page"),
-        Line::from("Home / End       first / last host"),
+        Line::from("Home / End       first / last row"),
         Line::from("/                focus search"),
-        Line::from("Enter            accept search or connect"),
+        Line::from("Enter            accept search, toggle group or connect"),
+        Line::from("Space            expand / collapse selected group"),
         Line::from("Esc              clear search or close overlay"),
         Line::from("i                technical details"),
         Line::from("r                reload SSH config"),
+        Line::from("w                view config warnings"),
         Line::from("v                cycle ssh verbosity: -v, -vv, -vvv"),
         Line::from("?                toggle help"),
         Line::from("q / Ctrl-C       quit"),
@@ -142,6 +164,39 @@ fn render_help(frame: &mut Frame) {
             )),
     );
     frame.render_widget(help, area);
+}
+
+fn render_warnings(frame: &mut Frame, app: &App) {
+    let area = centered(frame.area(), 90, 18);
+    frame.render_widget(Clear, area);
+    let warnings = app.catalog.warnings();
+    let index = app.warning_index.min(warnings.len().saturating_sub(1));
+    let title = if warnings.is_empty() {
+        " Warnings - Esc to close ".to_string()
+    } else {
+        format!(
+            " Warning {} / {} - j next / k previous - Esc close ",
+            index + 1,
+            warnings.len()
+        )
+    };
+    let message = warnings
+        .get(index)
+        .map(String::as_str)
+        .unwrap_or("No configuration warnings.");
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(theme::BG).fg(theme::TEXT))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme::ACCENT))
+                    .title(title),
+            ),
+        area,
+    );
 }
 
 pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -173,6 +228,7 @@ mod tests {
                 hostname: Some(hostname.into()),
                 ..HostHints::default()
             },
+            metadata: Default::default(),
         };
         App::new(Catalog::from_hosts_for_test(vec![
             host("production", "api.internal"),
@@ -180,7 +236,7 @@ mod tests {
         ]))
     }
 
-    fn rendered(app: &App, width: u16, height: u16) -> String {
+    fn rendered(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         terminal
@@ -194,7 +250,7 @@ mod tests {
 
     #[test]
     fn wide_terminals_show_columns_details_pane_and_hints() {
-        let screen = rendered(&app(), 120, 24);
+        let screen = rendered(&mut app(), 120, 24);
         assert!(screen.contains("porteiro"));
         assert!(screen.contains("Hosts - 2 shown / 2 total"));
         assert!(screen.contains("HostName") && screen.contains("api.internal"));
@@ -206,21 +262,61 @@ mod tests {
 
     #[test]
     fn narrow_terminals_drop_optional_columns_and_the_details_pane() {
-        let screen = rendered(&app(), 40, 12);
+        let screen = rendered(&mut app(), 40, 12);
         assert!(screen.contains("production") && screen.contains("staging"));
         assert!(!screen.contains("HostName"));
         assert!(!screen.contains("Details"));
     }
 
     #[test]
+    fn header_keeps_the_running_version_visible_when_space_is_tight() {
+        for width in [120, 40, 18, 12, VERSION_LABEL.len() as u16] {
+            let screen = rendered(&mut app(), width, 12);
+            let header = screen.lines().next().unwrap();
+            assert!(
+                header.ends_with(VERSION_LABEL),
+                "{width} columns: {header:?}"
+            );
+            if width < 40 {
+                assert!(!header.contains("OpenSSH config hosts"));
+            }
+        }
+    }
+
+    #[test]
+    fn overlays_leave_the_version_visible() {
+        let mut app = app();
+        app.show_help = true;
+        assert!(rendered(&mut app, 120, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(VERSION_LABEL));
+        app.show_help = false;
+        app.show_detail_overlay = true;
+        assert!(rendered(&mut app, 120, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(VERSION_LABEL));
+        app.show_detail_overlay = false;
+        app.show_warnings = true;
+        assert!(rendered(&mut app, 120, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(VERSION_LABEL));
+    }
+
+    #[test]
     fn overlays_render_on_top_of_the_list() {
         let mut app = app();
         app.show_detail_overlay = true;
-        assert!(rendered(&app, 120, 24).contains("Details - Esc to close"));
+        assert!(rendered(&mut app, 120, 24).contains("Details - Esc to close"));
 
         app.show_detail_overlay = false;
         app.show_help = true;
-        let screen = rendered(&app, 120, 24);
+        let screen = rendered(&mut app, 120, 24);
         assert!(screen.contains(" Help ") && screen.contains("toggle help"));
     }
 
@@ -235,12 +331,12 @@ mod tests {
     #[test]
     fn only_the_selected_row_carries_the_marker() {
         let mut app = app();
-        let screen = rendered(&app, 120, 24);
+        let screen = rendered(&mut app, 120, 24);
         assert!(line_containing(&screen, "api.internal").starts_with("│›"));
         assert!(line_containing(&screen, "staging.internal").starts_with("│ "));
 
         app.selected = 1;
-        let screen = rendered(&app, 120, 24);
+        let screen = rendered(&mut app, 120, 24);
         assert!(line_containing(&screen, "api.internal").starts_with("│ "));
         assert!(line_containing(&screen, "staging.internal").starts_with("│›"));
     }
@@ -248,11 +344,11 @@ mod tests {
     #[test]
     fn verbosity_badges_the_selected_row_and_the_enter_hint() {
         let mut app = app();
-        let screen = rendered(&app, 120, 24);
+        let screen = rendered(&mut app, 120, 24);
         assert!(!screen.contains("| ssh -v") && !screen.contains("connect -v"));
 
         app.verbosity = 2;
-        let screen = rendered(&app, 120, 24);
+        let screen = rendered(&mut app, 120, 24);
         let selected_row = line_containing(&screen, "api.internal");
         assert!(selected_row.contains("production   -vv "), "{selected_row}");
         assert!(!line_containing(&screen, "staging.internal").contains("-vv"));
@@ -260,7 +356,7 @@ mod tests {
         assert!(screen.contains("2 host(s) | ssh -vv |"));
 
         app.show_help = true;
-        assert!(rendered(&app, 120, 24).contains("cycle ssh verbosity"));
+        assert!(rendered(&mut app, 120, 24).contains("cycle ssh verbosity"));
     }
 
     #[test]
@@ -268,10 +364,118 @@ mod tests {
         let mut app = app();
         app.filter_focused = true;
         app.filter = "nothing-matches".into();
-        let screen = rendered(&app, 120, 24);
+        app.refresh_filter();
+        let screen = rendered(&mut app, 120, 24);
         assert!(screen.contains("search: nothing-matches_"));
         assert!(screen.contains("Nothing matches the current search"));
         assert!(screen.contains("type to search"));
+    }
+
+    #[test]
+    fn grouped_rows_render_counts_badges_colors_and_group_specific_hints() {
+        let mut app = app();
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts[0].metadata = crate::catalog::HostMetadata {
+            group: Some("Work".into()),
+            tags: vec!["prod".into(), "api".into()],
+            color: Some(crate::catalog::AccentColor::Red),
+        };
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        app.selected = 0;
+        app.verbosity = 2;
+        let screen = rendered(&mut app, 96, 20);
+        assert!(screen.contains("▸ Work (1)"));
+        assert!(!screen.contains("production"));
+        assert!(screen.contains("staging"));
+        assert!(screen.contains("Space/Enter expand/collapse"));
+        assert!(!line_containing(&screen, "Work (1)").contains("-vv"));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.selected = 1;
+        let screen = rendered(&mut app, 96, 20);
+        assert!(screen.contains("▾ Work (1)"));
+        let row = line_containing(&screen, "production");
+        assert!(row.contains("[prod]") && row.contains("[api]"), "{row}");
+        assert!(row.contains("-vv"));
+
+        let mut terminal = Terminal::new(TestBackend::new(96, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let cells = &terminal.backend().buffer().content;
+        assert!(cells
+            .iter()
+            .any(|cell| cell.symbol() == "p" && cell.fg == ratatui::style::Color::LightRed));
+        assert!(cells
+            .iter()
+            .any(|cell| cell.symbol() == "▾" && cell.fg == ratatui::style::Color::LightRed));
+    }
+
+    #[test]
+    fn narrow_grouped_rows_preserve_aliases_and_details_retain_all_tags() {
+        let mut app = app();
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts[0].metadata.group = Some("Equipe 東京".into());
+        hosts[0].metadata.tags = vec!["produção".into(), "database".into()];
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        app.filter = "production".into();
+        app.refresh_filter();
+        let screen = rendered(&mut app, 24, 12);
+        assert!(screen.contains("production"));
+        assert!(!screen.contains("[produção]"));
+        assert!(screen.contains("+2"));
+        app.show_detail_overlay = true;
+        let screen = rendered(&mut app, 100, 24);
+        assert!(screen.contains("Tags") && screen.contains("produção, database"));
+        for (width, height) in [(1, 1), (4, 3), (12, 5)] {
+            rendered(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn viewport_is_preserved_while_moving_within_the_visible_page() {
+        let mut app = app();
+        let template = app.catalog.hosts()[0].clone();
+        let hosts = (0..40)
+            .map(|index| {
+                let mut host = template.clone();
+                host.alias = format!("host-{index:02}");
+                host
+            })
+            .collect();
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        app.selected = 30;
+        rendered(&mut app, 60, 12);
+        let offset = app.table_state.offset();
+        assert!(offset > 0);
+        app.selected = 29;
+        rendered(&mut app, 60, 12);
+        assert_eq!(app.table_state.offset(), offset);
+    }
+
+    #[test]
+    fn warnings_show_source_and_can_be_paged_without_connecting() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        std::fs::write(
+            &config,
+            "Host api\n# porteiro: color=invalid\n# porteiro: unknown=value\n",
+        )
+        .unwrap();
+        let mut app = App::new(Catalog::load(&config).unwrap());
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        app.handle_key(key(crossterm::event::KeyCode::Char('w')));
+        let screen = rendered(&mut app, 100, 24);
+        assert!(screen.contains("Warning 1 / 2"));
+        assert!(screen.contains("config:2:"));
+        assert!(screen.contains("unknown color"));
+        app.handle_key(key(crossterm::event::KeyCode::Down));
+        let screen = rendered(&mut app, 100, 24);
+        assert!(screen.contains("Warning 2 / 2"));
+        assert!(screen.contains("config:3:"));
+        assert!(screen.contains("unknown metadata key"));
     }
 
     #[test]
