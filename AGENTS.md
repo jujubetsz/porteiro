@@ -32,8 +32,10 @@ standard SSH terminology without extending the name into a metaphor.
   a glob remain non-fatal because OpenSSH ignores those entries.
 - Ask OpenSSH for effective details with `ssh -G`; do not reimplement its
   complete matching and precedence semantics.
-- Treat catalog fields as declaration hints only; the details view from
-  `ssh -G` is the effective result. Resolving a selected alias can evaluate
+- Treat catalog fields as hints only; the details view from `ssh -G` is the
+  effective result. Show the default Port 22 only when catalog validation
+  leaves the port definitely unset; an uncertain Match or Include must not
+  turn an unknown port into 22. Resolving a selected alias can evaluate
   user-authored `Match exec` directives and must retain its timeout.
 - Disable hostname and CNAME canonicalization only for `ssh -G` previews so
   browsing does not trigger DNS. Never apply these overrides to connections.
@@ -47,10 +49,11 @@ standard SSH terminology without extending the name into a metaphor.
 
 ## Current scope
 
-The surface is one full-screen host list with fuzzy search, collapsible groups,
-tags, colors, responsive technical details, config reload, warnings, help, and
-one-shot connection. Editing, favorites, recents, nested groups, persistent
-application state, SFTP, and an embedded SSH implementation are out of scope.
+The surface is one full-screen host list with fuzzy search, nested collapsible
+groups, tags, colors, host visibility annotations, responsive technical details,
+config reload, warnings, help, and one-shot connection. Editing, favorites,
+recents, persistent application state, SFTP, and an embedded SSH implementation
+are out of scope.
 
 Grouping metadata uses full-line `# porteiro:` comments in the SSH config.
 File defaults precede the first local Host/Match; Host annotations override
@@ -59,6 +62,16 @@ flows through Include or participates in SSH matching. Keep metadata from the
 retained reachable declaration, not an earlier conservative candidate. Invalid
 annotations warn with file/line and apply no partial update. Reject control and
 bidirectional formatting characters in metadata displayed by the terminal.
+The `hidden=true` annotation excludes a host from the catalog UI only after
+reachability validation and deduplication; it cannot mask configuration errors
+or allow a later declaration to revive a hidden alias. It shares the same
+file-local scope as other metadata, and `hidden=false` clears a hidden default.
+Keep `group` a literal single-level name; `group_path` splits on `/`, trims each
+component and rejects empty components. Both replace the entire inherited path
+and cannot coexist on one annotation. Use full component paths for group
+identity so literal slashes and identically named subgroups cannot collide.
+Tag badges use their own fixed neutral foreground and background, including
+on selected rows; never inherit the host or group accent color.
 
 ## Architecture
 
@@ -101,6 +114,10 @@ bidirectional formatting characters in metadata displayed by the terminal.
   expansion or catalog changes. Group selection must never resolve or connect
   an SSH destination. Search expansion is temporary; keep normal expansion in
   memory only. Retain Ratatui's table state across renders for stable scrolling.
+  Group counts include all descendant hosts. At each level, render subgroups
+  before directly assigned hosts, with cached tree connectors. Search opens
+  all matching ancestors; clipping deep indentation must preserve alias and
+  connection-verbosity readability.
 - `src/main.rs`: orchestration, terminal lifecycle, and exit status propagation.
 
 Keep side effects outside the synchronous key handler. Key handling should

@@ -34,13 +34,14 @@ pub struct Host {
 
 impl Host {
     pub fn search_score(&self, query: &str) -> Option<i64> {
+        let group_path = self.metadata.group.join("/");
         [
             self.alias.as_str(),
             self.hints.hostname.as_deref().unwrap_or_default(),
             self.hints.user.as_deref().unwrap_or_default(),
             self.hints.port.as_deref().unwrap_or_default(),
             self.hints.proxy_jump.as_deref().unwrap_or_default(),
-            self.metadata.group.as_deref().unwrap_or_default(),
+            group_path.as_str(),
         ]
         .into_iter()
         .chain(self.metadata.tags.iter().map(String::as_str))
@@ -311,6 +312,10 @@ impl Builder {
     fn into_catalog(mut self, config_path: &Path, root: &Path) -> Result<Catalog, CatalogError> {
         self.parse_file(root, false, &mut Vec::new(), &mut false, &mut Vec::new())?;
         self.retain_reachable_hosts(root)?;
+        // Visibility uses the retained declaration's metadata. Validate and
+        // deduplicate first: hiding must not mask config errors or let a later
+        // duplicate resurrect an intentionally hidden alias.
+        self.hosts.retain(|host| !host.metadata.hidden);
         Ok(Catalog {
             config_path: config_path.to_path_buf(),
             hosts: self.hosts,
@@ -1166,7 +1171,7 @@ impl TargetOptions {
                 .known()
                 .map(|hostname| expand_hostname(hostname, alias)),
             user: self.user.known().map(str::to_string),
-            port: self.port.known().map(str::to_string),
+            port: self.port.resolve_or(|| "22".to_string()),
             proxy_jump: self.proxy.jump_hint(),
             proxy_command: self.proxy.command_hint(),
         }
@@ -2437,12 +2442,12 @@ Host API
         );
         let hosts = catalog.hosts();
         assert_eq!(hosts[0].metadata, hosts[1].metadata);
-        assert_eq!(hosts[0].metadata.group.as_deref(), Some("Work Team"));
+        assert_eq!(hosts[0].metadata.group, ["Work Team"]);
         assert_eq!(hosts[0].metadata.tags, ["prod", "api"]);
         assert_eq!(hosts[0].metadata.color, Some(AccentColor::Red));
         assert_eq!(hosts[2].metadata.tags, ["company"]);
         assert_eq!(hosts[2].metadata.color, Some(AccentColor::Blue));
-        assert_eq!(hosts[3].metadata.group.as_deref(), Some("Personal"));
+        assert_eq!(hosts[3].metadata.group, ["Personal"]);
         assert_eq!(hosts[4].metadata, HostMetadata::default());
         assert_eq!(catalog.filtered_indices("Work Team").len(), 3);
         assert_eq!(catalog.filtered_indices("prod"), [0, 1]);
@@ -2474,10 +2479,10 @@ Host sibling
         let catalog = fixture.load().unwrap();
         assert_eq!(aliases(&catalog), ["child", "plain", "parent", "sibling"]);
         let hosts = catalog.hosts();
-        assert_eq!(hosts[0].metadata.group.as_deref(), Some("Child"));
+        assert_eq!(hosts[0].metadata.group, ["Child"]);
         assert_eq!(hosts[0].metadata.color, None);
         assert_eq!(hosts[1].metadata, HostMetadata::default());
-        assert_eq!(hosts[2].metadata.group.as_deref(), Some("Root"));
+        assert_eq!(hosts[2].metadata.group, ["Root"]);
         assert_eq!(hosts[2].metadata.color, Some(AccentColor::Blue));
         assert_eq!(hosts[2].metadata.tags, ["parent"]);
         assert_eq!(hosts[2].hints.user.as_deref(), Some("deploy"));
@@ -2501,10 +2506,7 @@ Host sibling
         );
         let catalog = fixture.load().unwrap();
         assert_eq!(aliases(&catalog), ["gate", "duplicate"]);
-        assert_eq!(
-            catalog.hosts()[1].metadata.group.as_deref(),
-            Some("Reachable")
-        );
+        assert_eq!(catalog.hosts()[1].metadata.group, ["Reachable"]);
     }
 
     #[test]
@@ -2516,7 +2518,7 @@ Host sibling
         assert!(catalog
             .hosts()
             .iter()
-            .all(|host| host.metadata.group.as_deref() == Some("Work")));
+            .all(|host| host.metadata.group == ["Work"]));
         assert_eq!(catalog.warnings().len(), 3);
         assert!(catalog.warnings()[0].contains("config:3: ignored porteiro annotation"));
         assert!(catalog.warnings()[0].contains("unknown color"));
@@ -2547,6 +2549,95 @@ Host sibling
             "# porteiro: group=Cycle\nInclude config\n",
         );
         assert!(fixture.load().unwrap_err().to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn nested_group_defaults_override_atomically_and_remain_file_local() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            r#"
+# porteiro: group_path="Work / Production" tags=company
+Include child.conf
+Host api
+Host flat
+    # porteiro: group="Work/Production"
+Host overridden
+    # porteiro: group_path="Work/Staging"
+Host standalone
+    # porteiro: group_path=""
+Host invalid
+    # porteiro: group_path="Work//Wrong" tags=wrong
+"#,
+        );
+        fixture.write(".ssh/child.conf", "Host child\n");
+        let catalog = fixture.load().unwrap();
+        let hosts = catalog.hosts();
+        assert!(hosts[0].metadata.group.is_empty());
+        assert_eq!(hosts[1].metadata.group, ["Work", "Production"]);
+        assert_eq!(hosts[2].metadata.group, ["Work/Production"]);
+        assert_eq!(hosts[3].metadata.group, ["Work", "Staging"]);
+        assert!(hosts[4].metadata.group.is_empty());
+        assert_eq!(hosts[5].metadata.group, ["Work", "Production"]);
+        assert_eq!(hosts[5].metadata.tags, ["company"]);
+        assert_eq!(catalog.filtered_indices("Work/Production"), [1, 2, 5]);
+        assert_eq!(catalog.warnings().len(), 1);
+        assert!(catalog.warnings()[0].contains("config:12:"));
+    }
+
+    #[test]
+    fn hidden_hosts_use_file_defaults_and_explicit_overrides_without_changing_ssh_hints() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "# porteiro: hidden=true\nInclude child.conf\nHost secret secret-alt\nHost visible\n# porteiro: hidden=false\nHost SECRET\n# porteiro: hidden=false\nHost *\nUser deploy\nPort 2222\n",
+        );
+        fixture.write(".ssh/child.conf", "Host child\n");
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["child", "visible"]);
+        assert!(catalog.warnings().is_empty());
+        assert!(catalog.filtered_indices("secret").is_empty());
+        assert!(catalog.hosts().iter().all(|host| {
+            host.hints.user.as_deref() == Some("deploy")
+                && host.hints.port.as_deref() == Some("2222")
+        }));
+    }
+
+    #[test]
+    fn hidden_annotations_use_the_reachable_origin_and_invalid_updates_are_atomic() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "Host gate\nInclude conditional.conf\nHost *\nInclude global.conf\n# porteiro: hidden=true\nMatch all\n# porteiro: hidden=true\n",
+        );
+        fixture.write(
+            ".ssh/conditional.conf",
+            "Host visible\n# porteiro: hidden=true\nHost secret\n",
+        );
+        fixture.write(
+            ".ssh/global.conf",
+            "Host visible\n# porteiro: hidden=true color=invalid\nHost secret\n# porteiro: hidden=true\n",
+        );
+        let catalog = fixture.load().unwrap();
+        assert_eq!(aliases(&catalog), ["gate", "visible"]);
+        assert_eq!(catalog.warnings().len(), 3);
+        assert!(catalog
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("global.conf:2:")));
+    }
+
+    #[test]
+    fn hiding_all_hosts_does_not_skip_reachable_include_errors() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            "Host secret\n# porteiro: hidden=true\nInclude cycle.conf\n",
+        );
+        fixture.write(".ssh/cycle.conf", "Include config\n");
+        assert!(fixture.load().unwrap_err().to_string().contains("cycle"));
+        fixture.write(".ssh/cycle.conf", "# no cycle\n");
+        assert!(fixture.load().unwrap().hosts().is_empty());
     }
 
     #[test]
@@ -3477,6 +3568,75 @@ Host staging
 
         let catalog = fixture.load().unwrap();
         assert_eq!(catalog.hosts()[0].alias, "hashed");
+    }
+
+    #[test]
+    fn port_hints_default_to_22_and_preserve_configured_values() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            r#"
+Host service-*
+  Port 2200
+Host default explicit service-api included
+Host explicit
+  Port 2222
+Host included
+  Include port.conf
+"#,
+        );
+        fixture.write(".ssh/port.conf", "Port 2022\n");
+
+        let catalog = fixture.load().unwrap();
+        assert_eq!(
+            aliases(&catalog),
+            ["default", "explicit", "service-api", "included"]
+        );
+        let ports: Vec<_> = catalog
+            .hosts()
+            .iter()
+            .map(|host| host.hints.port.as_deref())
+            .collect();
+        assert_eq!(
+            ports,
+            [Some("22"), Some("2222"), Some("2200"), Some("2022")]
+        );
+    }
+
+    #[test]
+    fn port_hints_preserve_uncertainty_and_first_value_precedence() {
+        let fixture = Fixture::new();
+        let marker = fixture.home().join("must-not-exist");
+        fixture.write(
+            ".ssh/config",
+            &format!(
+                r#"
+Host uncertain fallback known only-user
+Match originalhost uncertain,fallback exec "touch {}"
+  Port 2200
+Host fallback known
+  Port 2222
+Match originalhost known exec "exit 0"
+  Port 2200
+Match originalhost only-user exec "exit 0"
+  User conditional
+"#,
+                marker.display()
+            ),
+        );
+
+        let catalog = fixture.load().unwrap();
+        assert_eq!(
+            aliases(&catalog),
+            ["uncertain", "fallback", "known", "only-user"]
+        );
+        let ports: Vec<_> = catalog
+            .hosts()
+            .iter()
+            .map(|host| host.hints.port.as_deref())
+            .collect();
+        assert_eq!(ports, [None, None, Some("2222"), Some("22")]);
+        assert!(!marker.exists());
     }
 
     #[test]

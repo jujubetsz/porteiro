@@ -277,7 +277,7 @@ impl App {
 
     fn replace_catalog(&mut self, catalog: Catalog) {
         let selected_alias = self.selected_alias().map(|alias| alias.to_lowercase());
-        let selected_group = self.selected_group().map(|group| group.name.clone());
+        let selected_group = self.selected_group().map(|group| group.path.clone());
         let mut list = HostList::new(&catalog);
         list.restore_expansion(&self.list);
         list.filter(&catalog, &self.filter);
@@ -289,7 +289,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|alias| catalog.hosts()[*index].alias.to_lowercase() == *alias),
                 VisibleRow::Group(index) => {
-                    selected_group.as_ref() == Some(&list.groups[*index].name)
+                    selected_group.as_ref() == Some(&list.groups[*index].path)
                 }
             })
             .unwrap_or(0);
@@ -382,12 +382,12 @@ mod tests {
 
     fn grouped_app() -> App {
         let mut api = host("api", "api.internal");
-        api.metadata.group = Some("Work".into());
+        api.metadata.group = vec!["Work".into()];
         api.metadata.tags = vec!["critical".into()];
         let mut backup = host("backup", "backup.internal");
-        backup.metadata.group = Some("Personal".into());
+        backup.metadata.group = vec!["Personal".into()];
         let mut staging = host("staging", "staging.internal");
-        staging.metadata.group = Some("Work".into());
+        staging.metadata.group = vec!["Work".into()];
         App::new(Catalog::from_hosts_for_test(vec![
             host("standalone", "localhost"),
             api,
@@ -516,6 +516,116 @@ mod tests {
         assert!(app.selected_host().is_none());
         assert_eq!(app.handle_key(press(KeyCode::Down)), None);
         assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn nested_groups_toggle_independently_and_only_hosts_connect() {
+        let mut app = nested_app();
+        assert_eq!(app.list.groups[0].total, 3);
+        assert_eq!(app.list.shown_hosts, 1);
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), None);
+        assert_eq!(app.handle_key(press(KeyCode::Down)), None);
+        assert_eq!(app.selected_group().unwrap().path, ["Production", "APIs"]);
+        assert_eq!(app.handle_key(press(KeyCode::Char(' '))), None);
+        assert_eq!(
+            app.handle_key(press(KeyCode::Down)),
+            Some(Action::Resolve("prod-api".into()))
+        );
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter)),
+            Some(Action::Connect("prod-api".into()))
+        );
+        assert_eq!(app.list.shown_hosts, 3); // API, direct bastion, ungrouped host.
+
+        app.handle_key(press(KeyCode::Home));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.list.shown_hosts, 1);
+        assert!(app.list.is_expanded(1)); // Closing a parent preserves its children.
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.list.shown_hosts, 3);
+        assert!(!app.list.is_expanded(4)); // Staging/APIs is a different group.
+    }
+
+    fn nested_app() -> App {
+        let mut hosts = Vec::new();
+        for (alias, path) in [
+            ("prod-api", vec!["Production", "APIs"]),
+            ("prod-db", vec!["Production", "Data"]),
+            ("staging-api", vec!["Staging", "APIs"]),
+            ("bastion", vec!["Production"]),
+            ("plain", vec![]),
+        ] {
+            let mut host = host(alias, "localhost");
+            host.metadata.group = path.into_iter().map(str::to_string).collect();
+            hosts.push(host);
+        }
+        App::new(Catalog::from_hosts_for_test(hosts))
+    }
+
+    #[test]
+    fn nested_search_opens_all_ancestors_and_restores_the_previous_tree() {
+        let mut app = nested_app();
+        app.handle_key(press(KeyCode::Enter)); // Production is open, its children closed.
+        app.filter = "staging-api".into();
+        app.refresh_filter();
+        assert_eq!(
+            app.list.rows,
+            [
+                VisibleRow::Group(3),
+                VisibleRow::Group(4),
+                VisibleRow::Host(2)
+            ]
+        );
+        assert_eq!(app.selected_host().unwrap().alias, "staging-api");
+        app.handle_key(press(KeyCode::Home));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.list.shown_hosts, 0);
+
+        app.filter = "APIs".into();
+        app.refresh_filter();
+        assert_eq!(app.list.shown_hosts, 2);
+        assert_eq!(app.list.groups[0].matched, 1);
+        assert_eq!(app.list.groups[0].total, 3);
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.list.is_expanded(0));
+        for index in 1..app.list.groups.len() {
+            assert!(!app.list.is_expanded(index));
+        }
+        assert_eq!(app.list.shown_hosts, 2);
+    }
+
+    #[test]
+    fn nested_reload_tracks_full_paths_even_when_indices_change() {
+        let mut app = nested_app();
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts.reverse();
+        let mut literal = host("literal", "localhost");
+        literal.metadata.group = vec!["Production/APIs".into()];
+        hosts.push(literal);
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        assert_eq!(app.selected_group().unwrap().path, ["Production", "APIs"]);
+        for (index, group) in app.list.groups.iter().enumerate() {
+            assert_eq!(
+                app.list.is_expanded(index),
+                group.path == ["Production"] || group.path == ["Production", "APIs"]
+            );
+        }
+        assert_eq!(
+            app.handle_key(press(KeyCode::Down)),
+            Some(Action::Resolve("prod-api".into()))
+        );
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts.retain(|host| host.alias != "prod-api");
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        assert!(app
+            .list
+            .groups
+            .iter()
+            .all(|group| group.path != ["Production", "APIs"]));
+        assert!(app.selected < app.list.rows.len());
     }
 
     #[test]

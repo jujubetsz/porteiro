@@ -90,7 +90,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = panel(&title);
     if visible.is_empty() {
         let message = if app.filter.trim().is_empty() {
-            "No concrete Host aliases found in this SSH config."
+            "No visible Host aliases found in this SSH config."
         } else {
             "Nothing matches the current search. Press Esc to clear it."
         };
@@ -137,6 +137,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     is_selected,
                     badge.as_deref().filter(|_| is_selected),
                     usize::from(alias_width),
+                    app.list.prefix(position),
                 ),
                 VisibleRow::Group(index) => group_row(
                     &app.list.groups[index],
@@ -144,6 +145,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     &columns,
                     is_selected,
                     usize::from(alias_width),
+                    app.list.prefix(position),
                 ),
             }
         })
@@ -172,24 +174,31 @@ fn group_row(
     columns: &[Column],
     selected: bool,
     width: usize,
+    prefix: &str,
 ) -> Row<'static> {
     let marker = if expanded { "▾" } else { "▸" };
-    let count = if group.matches.len() == group.total {
+    let count = if group.matched == group.total {
         group.total.to_string()
     } else {
-        format!("{}/{}", group.matches.len(), group.total)
+        format!("{}/{}", group.matched, group.total)
     };
-    let name = truncate_label(&group.name, width.saturating_sub(count.len() + 5));
+    let prefix = fit_tree_prefix(prefix, width.saturating_sub(12));
+    let label_width = width.saturating_sub(Span::raw(&prefix).width());
+    let name = truncate_label(&group.name, label_width.saturating_sub(count.len() + 5));
+    let label = truncate_label(&format!("{marker} {name} ({count})"), label_width);
     let cells = columns
         .iter()
         .map(|column| match column {
             Column::Marker => Cell::from(if selected { "›" } else { " " }),
-            Column::Alias => Cell::from(Span::styled(
-                format!("{marker} {name} ({count})"),
-                Style::default()
-                    .fg(theme::accent(group.color))
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Column::Alias => Cell::from(Line::from(vec![
+                Span::styled(prefix.clone(), Style::default().fg(theme::MUTED)),
+                Span::styled(
+                    label.clone(),
+                    Style::default()
+                        .fg(theme::accent(group.color))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
             _ => Cell::from(""),
         })
         .collect::<Vec<_>>();
@@ -202,12 +211,13 @@ fn row(
     selected: bool,
     badge: Option<&str>,
     alias_width: usize,
+    prefix: &str,
 ) -> Row<'static> {
     let cells: Vec<Cell> = columns
         .iter()
         .map(|column| match column {
             Column::Marker => Cell::from(if selected { "›" } else { " " }),
-            Column::Alias => Cell::from(alias_line(host, badge, alias_width)),
+            Column::Alias => Cell::from(alias_line(host, badge, alias_width, prefix)),
             Column::Hostname => {
                 Cell::from(host.hints.hostname.clone().unwrap_or_else(|| "-".into()))
             }
@@ -229,20 +239,20 @@ fn row_style(selected: bool) -> Style {
 
 /// Optional tags use only the space left after the alias and connection flag.
 /// Measure terminal cells (including wide Unicode), not UTF-8 bytes.
-fn alias_line(host: &Host, badge: Option<&str>, width: usize) -> Line<'static> {
-    let indent = if host.metadata.group.is_some() {
-        "  "
-    } else {
-        ""
-    };
+fn alias_line(host: &Host, badge: Option<&str>, width: usize, prefix: &str) -> Line<'static> {
     // Reserve the connection flag before optional tags or a long alias. Below
     // the minimum useful width, the status line still reports the pending flag.
     let badge = badge.filter(|flag| width >= flag.len() + 6);
     let alias_width = width.saturating_sub(badge.map_or(0, |flag| flag.len() + 4));
-    let mut spans = vec![Span::styled(
-        truncate_label(&format!("{indent}{}", host.alias), alias_width),
-        Style::default().fg(theme::accent(host.metadata.color)),
-    )];
+    let prefix = fit_tree_prefix(prefix, alias_width.saturating_sub(12));
+    let prefix_width = Span::raw(&prefix).width();
+    let mut spans = vec![
+        Span::styled(prefix, Style::default().fg(theme::MUTED)),
+        Span::styled(
+            truncate_label(&host.alias, alias_width.saturating_sub(prefix_width)),
+            Style::default().fg(theme::accent(host.metadata.color)),
+        ),
+    ];
     if let Some(flag) = badge {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -255,8 +265,8 @@ fn alias_line(host: &Host, badge: Option<&str>, width: usize) -> Line<'static> {
     }
     let mut used: usize = spans.iter().map(Span::width).sum();
     for (index, tag) in host.metadata.tags.iter().enumerate() {
-        let label = format!(" [{tag}]");
-        let label_width = Span::raw(&label).width();
+        let label = format!(" {tag} ");
+        let label_width = 1 + Span::raw(&label).width();
         let remaining = host.metadata.tags.len() - index - 1;
         let suffix = if remaining > 0 {
             format!(" +{remaining}")
@@ -270,13 +280,34 @@ fn alias_line(host: &Host, badge: Option<&str>, width: usize) -> Line<'static> {
             }
             break;
         }
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
             label,
-            Style::default().fg(theme::accent(host.metadata.color)),
+            Style::default()
+                .fg(theme::TAG_FG)
+                .bg(theme::TAG_BG)
+                .remove_modifier(Modifier::BOLD),
         ));
         used += label_width;
     }
     Line::from(spans)
+}
+
+/// Omit distant ancestors before sacrificing the destination label. Every
+/// connector occupies three cells and contains no user-authored text.
+fn fit_tree_prefix(prefix: &str, width: usize) -> String {
+    let cells = prefix.chars().count();
+    if cells <= width {
+        return prefix.to_string();
+    }
+    if width < 5 {
+        return String::new();
+    }
+    let tail = ((width - 2) / 3) * 3;
+    format!(
+        "… {}",
+        prefix.chars().skip(cells - tail).collect::<String>()
+    )
 }
 
 /// Keep grapheme clusters intact: truncating by bytes or scalar values can cut
@@ -353,17 +384,43 @@ mod tests {
             line: 1,
             hints: Default::default(),
             metadata: crate::catalog::HostMetadata {
-                group: Some("Work".into()),
+                group: vec!["Work".into()],
                 tags: vec!["production".into()],
                 color: None,
+                hidden: false,
             },
         };
-        let line = alias_line(&host, Some("-vvv"), 20);
+        let line = alias_line(&host, Some("-vvv"), 20, "└─ ");
         assert!(line.to_string().contains('…'));
         assert!(line.to_string().ends_with(" -vvv "));
-        assert!(!line.to_string().contains("[production]"));
+        assert!(!line.to_string().contains("production"));
         assert_eq!(line.width(), 20);
-        assert!(alias_line(&host, Some("-vvv"), 3).width() <= 3);
+        assert!(alias_line(&host, Some("-vvv"), 3, "└─ ").width() <= 3);
+    }
+
+    #[test]
+    fn tag_badges_fit_unicode_cells_and_report_overflow_without_cutting_tags() {
+        let host = Host {
+            alias: "api".into(),
+            source: "config".into(),
+            line: 1,
+            hints: Default::default(),
+            metadata: crate::catalog::HostMetadata {
+                tags: vec!["東京".into(), "e\u{301}".into()],
+                ..Default::default()
+            },
+        };
+        let full = alias_line(&host, None, 14, "");
+        assert_eq!(full.to_string(), "api  東京   e\u{301} ");
+        assert_eq!(full.width(), 14);
+        let partial = alias_line(&host, None, 13, "");
+        assert_eq!(partial.to_string(), "api  東京  +1");
+        assert_eq!(partial.width(), 13);
+        let narrow = alias_line(&host, None, 9, "");
+        assert_eq!(narrow.to_string(), "api +2");
+        for width in 0..30 {
+            assert!(alias_line(&host, Some("-vvv"), width, "│  └─ ").width() <= width);
+        }
     }
 
     #[test]

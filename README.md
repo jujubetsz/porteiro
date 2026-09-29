@@ -16,7 +16,7 @@ files.
 ╭ Hosts - 2 shown / 2 total ─────────────────────────────────╮╭ Details ───────────────────────────╮
 │  Alias                  HostName                     Port  ││Alias        production             │
 │› production             prod.example.test            2222  ││HostName     prod.example.test      │
-│  staging                staging.example.test         -     ││User         deploy                 │
+│  staging                staging.example.test         22    ││User         deploy                 │
 │                                                            ││Port         2222                   │
 │                                                            ││ProxyJump    bastion                │
 │                                                            ││ProxyCommand -                      │
@@ -109,7 +109,7 @@ Porteiro exits after the SSH session ends and returns the SSH process exit
 status to the calling shell. On Unix, a session terminated by a signal returns
 the conventional shell-visible status `128 + signal`.
 
-## Groups, tags and colors
+## Groups, tags, colors and visibility
 
 Add full-line `# porteiro:` comments to your SSH config or included files.
 These are Porteiro annotations, not SSH options. OpenSSH
@@ -141,13 +141,18 @@ Host standalone
 ```text
 ▸ Work (2)
 ▾ Personal (1)
-    personal [homelab]
-  standalone
+└─ personal  homelab
+standalone
 ```
 
 - Each host has at most one group and any number of comma-separated tags.
   Quote names containing spaces. Group and tag names are case-sensitive;
   search is case-insensitive. Repeated tags are shown once, in written order.
+- For nested groups, use `group_path="Production/APIs"`. Each `/` introduces
+  another level; spaces around each name are trimmed and empty components are
+  rejected. `group="Production/APIs"` remains a single literal group for
+  compatibility. Use only one of `group` and `group_path` on the same annotation;
+  either replaces the whole inherited path. `group_path=""` clears grouping.
 - Annotations before the first `Host` or `Match` in a file set that file's
   defaults. Inside a `Host` block they override fields for the concrete aliases
   declared in that block. The last valid annotation for a field wins;
@@ -161,30 +166,68 @@ Host standalone
   with a warning. Annotations do not apply wildcard matching or evaluate
   `Match` criteria. Inline comments after SSH options remain ordinary comments.
 - Colors are `red`, `yellow`, `green`, `blue`, `magenta`, `cyan`, `white`, `gray`
-  or `default`. They accent host names and tag text. A group's header uses the
+  or `default`. They accent host names. A group's header uses the
   color of its first retained host. Selection and labels remain visible without
   relying on color.
+- Tags appear as padded rectangular badges with a fixed neutral background
+  and text color. Their colors stay the same across host accents and selection.
+- Add `# porteiro: hidden=true` inside a `Host` block to hide its aliases from
+  Porteiro's list, search and groups. The SSH configuration and direct `ssh`
+  connections remain unchanged. This field follows the same file-local defaults
+  and declaration rules as other annotations; `hidden=false` overrides a hidden
+  default. Hidden declarations still undergo configuration validation.
 - Malformed annotations are ignored as a whole, with file and line diagnostics
   available through `w`. Unknown keys/colors, duplicate keys on one line and
   control/bidirectional formatting characters are rejected. Ordinary SSH
   syntax and Include errors retain their existing handling.
 
-Groups start collapsed above ungrouped hosts. Groups follow their first
-appearance, and hosts within them retain declaration order. Search also matches
-group names and tags, temporarily opens matching groups and ranks matching hosts
-within each group. Clearing the query restores the previous expansion state.
+Groups start collapsed above ungrouped hosts. At each level, subgroups follow
+their first appearance and precede directly assigned hosts, which retain
+declaration order. Counts include all descendant hosts. Identically named
+subgroups under different parents have independent expansion state. Search also
+matches full group paths and tags, temporarily opens all ancestors of matching
+hosts and ranks matching hosts within each group. Clearing the query restores
+the previous expansion state, including subgroups.
 Reload preserves surviving expanded groups and the selected row when it remains
 visible; expansion is kept only for the current session.
 
+For example:
+
+```sshconfig
+Host prod-api
+    # porteiro: group_path="Production/APIs" tags=api color=red
+Host prod-db
+    # porteiro: group_path="Production/Databases"
+Host bastion
+    # porteiro: group="Production"
+Host staging-api
+    # porteiro: group_path="Staging/APIs"
+Host legacy
+    # porteiro: hidden=true
+```
+
+```text
+▾ Production (3)
+├─ ▾ APIs (1)
+│  └─ prod-api  api
+├─ ▸ Databases (1)
+└─ bastion
+▸ Staging (1)
+```
+
 Tags share the alias column and give way to the alias and verbosity flag in
 narrow terminals. A `+N` marker reports hidden tags when space permits; `i` shows
-the full group and tag values in the details overlay.
+the full group path and tag values in the details overlay. In a deeply nested
+tree, distant ancestor connectors give way to host names and connection flags.
 
 ## How host discovery works
 
-Values shown in the list are lightweight hints taken from each exact `Host`
-block. The details view is authoritative: it asks OpenSSH for the selected
-alias's effective configuration with `ssh -G` under a three-second timeout.
+Values shown in the list are lightweight hints from the read-only catalog
+validation. When no applicable `Port` option is set, the list shows
+[OpenSSH's default port, 22](https://man.openbsd.org/ssh_config#Port). A port
+that depends on an unknown `Match` outcome or Include path remains `-`.
+The details view is authoritative: it asks OpenSSH for the selected alias's
+effective configuration with `ssh -G` under a three-second timeout.
 
 - OpenSSH evaluates user-authored `Match exec` directives while doing this, so
   commands intentionally present in the SSH config can run when a host is
