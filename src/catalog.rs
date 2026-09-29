@@ -1166,7 +1166,7 @@ impl TargetOptions {
                 .known()
                 .map(|hostname| expand_hostname(hostname, alias)),
             user: self.user.known().map(str::to_string),
-            port: self.port.known().map(str::to_string),
+            port: self.port.resolve_or(|| "22".to_string()),
             proxy_jump: self.proxy.jump_hint(),
             proxy_command: self.proxy.command_hint(),
         }
@@ -3477,6 +3477,75 @@ Host staging
 
         let catalog = fixture.load().unwrap();
         assert_eq!(catalog.hosts()[0].alias, "hashed");
+    }
+
+    #[test]
+    fn port_hints_default_to_22_and_preserve_configured_values() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".ssh/config",
+            r#"
+Host service-*
+  Port 2200
+Host default explicit service-api included
+Host explicit
+  Port 2222
+Host included
+  Include port.conf
+"#,
+        );
+        fixture.write(".ssh/port.conf", "Port 2022\n");
+
+        let catalog = fixture.load().unwrap();
+        assert_eq!(
+            aliases(&catalog),
+            ["default", "explicit", "service-api", "included"]
+        );
+        let ports: Vec<_> = catalog
+            .hosts()
+            .iter()
+            .map(|host| host.hints.port.as_deref())
+            .collect();
+        assert_eq!(
+            ports,
+            [Some("22"), Some("2222"), Some("2200"), Some("2022")]
+        );
+    }
+
+    #[test]
+    fn port_hints_preserve_uncertainty_and_first_value_precedence() {
+        let fixture = Fixture::new();
+        let marker = fixture.home().join("must-not-exist");
+        fixture.write(
+            ".ssh/config",
+            &format!(
+                r#"
+Host uncertain fallback known only-user
+Match originalhost uncertain,fallback exec "touch {}"
+  Port 2200
+Host fallback known
+  Port 2222
+Match originalhost known exec "exit 0"
+  Port 2200
+Match originalhost only-user exec "exit 0"
+  User conditional
+"#,
+                marker.display()
+            ),
+        );
+
+        let catalog = fixture.load().unwrap();
+        assert_eq!(
+            aliases(&catalog),
+            ["uncertain", "fallback", "known", "only-user"]
+        );
+        let ports: Vec<_> = catalog
+            .hosts()
+            .iter()
+            .map(|host| host.hints.port.as_deref())
+            .collect();
+        assert_eq!(ports, [None, None, Some("2222"), Some("22")]);
+        assert!(!marker.exists());
     }
 
     #[test]

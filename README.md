@@ -16,7 +16,7 @@ files.
 ╭ Hosts - 2 shown / 2 total ─────────────────────────────────╮╭ Details ───────────────────────────╮
 │  Alias                  HostName                     Port  ││Alias        production             │
 │› production             prod.example.test            2222  ││HostName     prod.example.test      │
-│  staging                staging.example.test         -     ││User         deploy                 │
+│  staging                staging.example.test         22    ││User         deploy                 │
 │                                                            ││Port         2222                   │
 │                                                            ││ProxyJump    bastion                │
 │                                                            ││ProxyCommand -                      │
@@ -182,9 +182,12 @@ the full group and tag values in the details overlay.
 
 ## How host discovery works
 
-Values shown in the list are lightweight hints taken from each exact `Host`
-block. The details view is authoritative: it asks OpenSSH for the selected
-alias's effective configuration with `ssh -G` under a three-second timeout.
+Values shown in the list are lightweight hints from the read-only catalog
+validation. When no applicable `Port` option is set, the list shows
+[OpenSSH's default port, 22](https://man.openbsd.org/ssh_config#Port). A port
+that depends on an unknown `Match` outcome or Include path remains `-`.
+The details view is authoritative: it asks OpenSSH for the selected alias's
+effective configuration with `ssh -G` under a three-second timeout.
 
 - OpenSSH evaluates user-authored `Match exec` directives while doing this, so
   commands intentionally present in the SSH config can run when a host is

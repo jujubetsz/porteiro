@@ -261,6 +261,43 @@ mod tests {
     }
 
     #[test]
+    fn port_column_shows_default_explicit_and_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config");
+        std::fs::write(
+            &config,
+            r#"
+Host plain-port explicit-port unknown-port
+Host explicit-port
+  Port 2222
+Match originalhost unknown-port exec "exit 0"
+  Port 2200
+"#,
+        )
+        .unwrap();
+        let mut app = App::new(Catalog::load(&config).unwrap());
+        let screen = rendered(&mut app, 180, 24);
+        let header = line_containing(&screen, "HostName");
+        let port_column = header[..header.find("Port").unwrap()].chars().count();
+
+        for (alias, expected) in [
+            ("plain-port", "22"),
+            ("explicit-port", "2222"),
+            ("unknown-port", "-"),
+        ] {
+            let row = screen
+                .lines()
+                .find(|row| {
+                    row.split_once("││")
+                        .is_some_and(|(list, _)| list.contains(alias))
+                })
+                .unwrap();
+            let port: String = row.chars().skip(port_column).take(6).collect();
+            assert_eq!(port.trim(), expected, "{row}");
+        }
+    }
+
+    #[test]
     fn narrow_terminals_drop_optional_columns_and_the_details_pane() {
         let screen = rendered(&mut app(), 40, 12);
         assert!(screen.contains("production") && screen.contains("staging"));

@@ -32,8 +32,10 @@ standard SSH terminology without extending the name into a metaphor.
   a glob remain non-fatal because OpenSSH ignores those entries.
 - Ask OpenSSH for effective details with `ssh -G`; do not reimplement its
   complete matching and precedence semantics.
-- Treat catalog fields as declaration hints only; the details view from
-  `ssh -G` is the effective result. Resolving a selected alias can evaluate
+- Treat catalog fields as hints only; the details view from `ssh -G` is the
+  effective result. Show the default Port 22 only when catalog validation
+  leaves the port definitely unset; an uncertain Match or Include must not
+  turn an unknown port into 22. Resolving a selected alias can evaluate
   user-authored `Match exec` directives and must retain its timeout.
 - Disable hostname and CNAME canonicalization only for `ssh -G` previews so
   browsing does not trigger DNS. Never apply these overrides to connections.
