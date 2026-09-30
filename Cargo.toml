@@ -1,6 +1,6 @@
 [package]
 name = "porteiro"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Resolver 3 makes cargo update (including Dependabot) prefer dependency
 # versions compatible with rust-version instead of breaking the MSRV job.

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0](https://github.com/jujubetsz/porteiro/compare/v0.3.0...v0.4.0) (2026-09-30)
+
+
+### Features
+
+* add subgroups ([5a588a9](https://github.com/jujubetsz/porteiro/commit/5a588a93cdbb4d620e594a854454c7dbc081d544))
+* display tags in aligned capsules ([5a588a9](https://github.com/jujubetsz/porteiro/commit/5a588a93cdbb4d620e594a854454c7dbc081d544))
+* display tags in aligned capsules ([7f45290](https://github.com/jujubetsz/porteiro/commit/7f452909e2fe2d4a52daad1034a999735a3d6840))
+
 ## [0.3.0](https://github.com/jujubetsz/porteiro/compare/v0.2.0...v0.3.0) (2026-09-29)
 
 
