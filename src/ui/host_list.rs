@@ -9,10 +9,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
+// Powerline semicircles occupy one terminal cell each in a Nerd Font.
+const TAG_LEFT: &str = "\u{e0b6}";
+const TAG_RIGHT: &str = "\u{e0b4}";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Column {
     Marker,
     Alias,
+    Tags,
     Hostname,
     User,
     Port,
@@ -20,20 +25,28 @@ enum Column {
 }
 
 impl Column {
-    const DISPLAY_ORDER: [Self; 6] = [
+    const DISPLAY_ORDER: [Self; 7] = [
         Self::Marker,
         Self::Alias,
+        Self::Tags,
         Self::Hostname,
         Self::User,
         Self::Port,
         Self::Source,
     ];
-    const OPTIONAL_BY_VALUE: [Self; 4] = [Self::Hostname, Self::User, Self::Port, Self::Source];
+    const OPTIONAL_BY_VALUE: [Self; 5] = [
+        Self::Tags,
+        Self::Hostname,
+        Self::User,
+        Self::Port,
+        Self::Source,
+    ];
 
     fn header(self) -> &'static str {
         match self {
             Self::Marker => "",
             Self::Alias => "Alias",
+            Self::Tags => "Tags",
             Self::Hostname => "HostName",
             Self::User => "User",
             Self::Port => "Port",
@@ -45,6 +58,7 @@ impl Column {
         match self {
             Self::Marker => 1,
             Self::Alias => 20,
+            Self::Tags => 20,
             Self::Hostname => 28,
             Self::User => 14,
             Self::Port => 6,
@@ -60,7 +74,7 @@ impl Column {
     }
 }
 
-fn visible_columns(area_width: u16) -> Vec<Column> {
+fn visible_columns(area_width: u16, has_tags: bool) -> Vec<Column> {
     let mut kept = vec![Column::Marker, Column::Alias];
     let cost = |columns: &[Column]| -> u16 {
         columns.iter().map(|column| column.width()).sum::<u16>()
@@ -68,6 +82,9 @@ fn visible_columns(area_width: u16) -> Vec<Column> {
             + 2
     };
     for candidate in Column::OPTIONAL_BY_VALUE {
+        if candidate == Column::Tags && !has_tags {
+            continue;
+        }
         let mut trial = kept.clone();
         trial.push(candidate);
         if cost(&trial) <= area_width {
@@ -103,7 +120,14 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let columns = visible_columns(area.width);
+    // Keep the layout stable while searching or opening groups. Only a catalog
+    // reload can change whether the optional Tags column is useful at all.
+    let has_tags = app
+        .catalog
+        .hosts()
+        .iter()
+        .any(|host| !host.metadata.tags.is_empty());
+    let columns = visible_columns(area.width, has_tags);
     let header = Row::new(
         columns
             .iter()
@@ -218,6 +242,10 @@ fn row(
         .map(|column| match column {
             Column::Marker => Cell::from(if selected { "›" } else { " " }),
             Column::Alias => Cell::from(alias_line(host, badge, alias_width, prefix)),
+            Column::Tags => Cell::from(tags_line(
+                &host.metadata.tags,
+                usize::from(Column::Tags.width()),
+            )),
             Column::Hostname => {
                 Cell::from(host.hints.hostname.clone().unwrap_or_else(|| "-".into()))
             }
@@ -237,10 +265,8 @@ fn row_style(selected: bool) -> Style {
     style
 }
 
-/// Optional tags use only the space left after the alias and connection flag.
-/// Measure terminal cells (including wide Unicode), not UTF-8 bytes.
 fn alias_line(host: &Host, badge: Option<&str>, width: usize, prefix: &str) -> Line<'static> {
-    // Reserve the connection flag before optional tags or a long alias. Below
+    // Reserve the connection flag before a long alias. Below
     // the minimum useful width, the status line still reports the pending flag.
     let badge = badge.filter(|flag| width >= flag.len() + 6);
     let alias_width = width.saturating_sub(badge.map_or(0, |flag| flag.len() + 4));
@@ -263,31 +289,45 @@ fn alias_line(host: &Host, badge: Option<&str>, width: usize, prefix: &str) -> L
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    let mut used: usize = spans.iter().map(Span::width).sum();
-    for (index, tag) in host.metadata.tags.iter().enumerate() {
-        let label = format!(" {tag} ");
-        let label_width = 1 + Span::raw(&label).width();
-        let remaining = host.metadata.tags.len() - index - 1;
+    Line::from(spans)
+}
+
+/// Render whole capsules in their own column, reserving a count for hidden
+/// tags. Measure terminal cells so wide and combining graphemes stay intact.
+fn tags_line(tags: &[String], width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut used = 0;
+    let caps = Style::default()
+        .fg(theme::TAG_BG)
+        .remove_modifier(Modifier::BOLD);
+    let label = Style::default()
+        .fg(theme::TAG_FG)
+        .bg(theme::TAG_BG)
+        .remove_modifier(Modifier::BOLD);
+    for (index, tag) in tags.iter().enumerate() {
+        let gap = usize::from(used > 0);
+        let label_width = gap + 2 + Span::raw(tag).width();
+        let remaining = tags.len() - index - 1;
         let suffix = if remaining > 0 {
             format!(" +{remaining}")
         } else {
             String::new()
         };
         if used + label_width + suffix.len() > width {
-            let overflow = format!(" +{}", remaining + 1);
+            let overflow = format!("{}+{}", if used > 0 { " " } else { "" }, remaining + 1);
             if used + overflow.len() <= width {
                 spans.push(Span::styled(overflow, Style::default().fg(theme::MUTED)));
             }
             break;
         }
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(theme::TAG_FG)
-                .bg(theme::TAG_BG)
-                .remove_modifier(Modifier::BOLD),
-        ));
+        if gap > 0 {
+            spans.push(Span::raw(" "));
+        }
+        // The caps inherit the row background; only their foreground and the
+        // label background form the capsule, including on the selected row.
+        spans.push(Span::styled(TAG_LEFT, caps));
+        spans.push(Span::styled(tag.clone(), label));
+        spans.push(Span::styled(TAG_RIGHT, caps));
         used += label_width;
     }
     Line::from(spans)
@@ -363,21 +403,43 @@ mod tests {
 
     #[test]
     fn narrow_layout_keeps_only_marker_and_alias() {
-        assert_eq!(visible_columns(24), [Column::Marker, Column::Alias]);
+        for has_tags in [false, true] {
+            assert_eq!(
+                visible_columns(24, has_tags),
+                [Column::Marker, Column::Alias]
+            );
+        }
     }
 
     #[test]
     fn wider_layout_adds_columns_in_value_order() {
-        let columns = visible_columns(80);
+        let columns = visible_columns(80, false);
         assert!(columns.contains(&Column::Hostname));
         assert!(columns.contains(&Column::User));
         assert!(!columns.contains(&Column::Source));
+        assert!(!columns.contains(&Column::Tags));
         assert_eq!(columns[0], Column::Marker);
         assert_eq!(columns[1], Column::Alias);
     }
 
     #[test]
-    fn long_aliases_leave_space_for_the_connection_flag_before_tags() {
+    fn tags_have_their_own_column_only_when_used_and_space_permits() {
+        assert_eq!(
+            visible_columns(74, true),
+            [
+                Column::Marker,
+                Column::Alias,
+                Column::Tags,
+                Column::Hostname
+            ]
+        );
+        assert!(!visible_columns(44, true).contains(&Column::Tags));
+        assert!(visible_columns(45, true).contains(&Column::Tags));
+        assert!(!visible_columns(200, false).contains(&Column::Tags));
+    }
+
+    #[test]
+    fn long_aliases_leave_space_for_the_connection_flag() {
         let host = Host {
             alias: "a-very-long-production-alias".into(),
             source: "config".into(),
@@ -400,27 +462,21 @@ mod tests {
 
     #[test]
     fn tag_badges_fit_unicode_cells_and_report_overflow_without_cutting_tags() {
-        let host = Host {
-            alias: "api".into(),
-            source: "config".into(),
-            line: 1,
-            hints: Default::default(),
-            metadata: crate::catalog::HostMetadata {
-                tags: vec!["東京".into(), "e\u{301}".into()],
-                ..Default::default()
-            },
-        };
-        let full = alias_line(&host, None, 14, "");
-        assert_eq!(full.to_string(), "api  東京   e\u{301} ");
-        assert_eq!(full.width(), 14);
-        let partial = alias_line(&host, None, 13, "");
-        assert_eq!(partial.to_string(), "api  東京  +1");
-        assert_eq!(partial.width(), 13);
-        let narrow = alias_line(&host, None, 9, "");
-        assert_eq!(narrow.to_string(), "api +2");
+        let tags = vec!["東京".into(), "e\u{301}".into()];
+        let full = tags_line(&tags, 10);
+        assert_eq!(full.to_string(), "東京 e\u{301}");
+        assert_eq!(full.width(), 10);
+        let partial = tags_line(&tags, 9);
+        assert_eq!(partial.to_string(), "東京 +1");
+        assert_eq!(partial.width(), 9);
+        assert_eq!(tags_line(&tags, 8).to_string(), "+2");
+        assert_eq!(tags_line(&[], 20).to_string(), "");
         for width in 0..30 {
-            assert!(alias_line(&host, Some("-vvv"), width, "│  └─ ").width() <= width);
+            assert!(tags_line(&tags, width).width() <= width);
         }
+        let long_tags = vec!["a-tag-too-long-for-this-column".into(); 12];
+        assert_eq!(tags_line(&long_tags, 20).to_string(), "+12");
+        assert_eq!(tags_line(&long_tags, 2).to_string(), "");
     }
 
     #[test]

@@ -49,6 +49,9 @@ files.
 ## Install
 
 Porteiro needs an OpenSSH-compatible `ssh` executable on the machine it runs on.
+For rounded tag badges, select a terminal font with the Powerline semicircle
+glyphs (`U+E0B6` and `U+E0B4`), such as a [Nerd Font](https://www.nerdfonts.com/).
+Porteiro cannot detect whether the terminal's font contains these glyphs.
 
 **Release binaries.** Download the archive for your platform from the
 [releases page](https://github.com/jujubetsz/porteiro/releases), verify the
@@ -169,8 +172,9 @@ standalone
   or `default`. They accent host names. A group's header uses the
   color of its first retained host. Selection and labels remain visible without
   relying on color.
-- Tags appear as padded rectangular badges with a fixed neutral background
-  and text color. Their colors stay the same across host accents and selection.
+- Tags appear as rounded capsules in a separate `Tags` column, with a fixed
+  neutral background and text color. Their colors stay the same across host
+  accents and selection, and each host still occupies one terminal row.
 - Add `# porteiro: hidden=true` inside a `Host` block to hide its aliases from
   Porteiro's list, search and groups. The SSH configuration and direct `ssh`
   connections remain unchanged. This field follows the same file-local defaults
@@ -207,18 +211,21 @@ Host legacy
 ```
 
 ```text
+Alias                   Tags
 ▾ Production (3)
 ├─ ▾ APIs (1)
-│  └─ prod-api  api
+│  └─ prod-api           api
 ├─ ▸ Databases (1)
 └─ bastion
 ▸ Staging (1)
 ```
 
-Tags share the alias column and give way to the alias and verbosity flag in
-narrow terminals. A `+N` marker reports hidden tags when space permits; `i` shows
-the full group path and tag values in the details overlay. In a deeply nested
-tree, distant ancestor connectors give way to host names and connection flags.
+The `Tags` column stays aligned independently of alias length and tree depth.
+It is omitted when no hosts have tags or the terminal is too narrow to keep
+the alias and connection flag readable. Whole badges fit within the column;
+a `+N` marker reports additional tags. Press `i` for the full group path and
+tag values, including when the column is hidden. In a deeply nested tree,
+distant ancestor connectors give way to host names and connection flags.
 
 ## How host discovery works
 

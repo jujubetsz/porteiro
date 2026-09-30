@@ -244,7 +244,19 @@ mod tests {
             .buffer()
             .content
             .chunks(usize::from(width))
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
+            .map(|row| {
+                let mut line = String::new();
+                let mut cells = row.iter();
+                while let Some(cell) = cells.next() {
+                    line.push_str(cell.symbol());
+                    // Continuation cells after a wide grapheme are storage,
+                    // not extra spaces displayed by the terminal.
+                    for _ in 1..Span::raw(cell.symbol()).width() {
+                        cells.next();
+                    }
+                }
+                line + "\n"
+            })
             .collect()
     }
 
@@ -256,6 +268,7 @@ mod tests {
         assert!(screen.contains("HostName") && screen.contains("api.internal"));
         assert!(screen.contains("staging.internal"));
         assert!(screen.contains("Details"));
+        assert!(!screen.contains("Tags"));
         assert!(screen.contains("2 host(s) | /home/tester/.ssh/config"));
         assert!(screen.contains("j/k move"));
     }
@@ -436,7 +449,7 @@ Match originalhost unknown-port exec "exit 0"
         let screen = rendered(&mut app, 96, 20);
         assert!(screen.contains("▾ Work (1)"));
         let row = line_containing(&screen, "production");
-        assert!(row.contains(" prod ") && row.contains(" api "), "{row}");
+        assert!(row.contains("prod api"), "{row}");
         assert!(row.contains("-vv"));
 
         let mut terminal = Terminal::new(TestBackend::new(96, 20)).unwrap();
@@ -459,10 +472,12 @@ Match originalhost unknown-port exec "exit 0"
         app.replace_catalog(Catalog::from_hosts_for_test(hosts));
         app.filter = "production".into();
         app.refresh_filter();
+        app.verbosity = 3;
         let screen = rendered(&mut app, 24, 12);
         assert!(screen.contains("production"));
         assert!(!screen.contains("produção"));
-        assert!(screen.contains("+2"));
+        assert!(!screen.contains("Tags"));
+        assert!(line_containing(&screen, "production").contains("-vvv"));
         app.show_detail_overlay = true;
         let screen = rendered(&mut app, 100, 24);
         assert!(screen.contains("Tags") && screen.contains("produção, database"));
@@ -472,11 +487,13 @@ Match originalhost unknown-port exec "exit 0"
     }
 
     #[test]
-    fn tag_badges_keep_their_colors_and_padding_on_selected_and_colored_rows() {
+    fn tag_capsules_align_and_keep_neutral_colors_on_selected_and_colored_rows() {
         let mut app = app();
         let mut hosts = app.catalog.hosts().to_vec();
         hosts[0].metadata.color = Some(crate::catalog::AccentColor::Red);
         hosts[1].metadata.color = Some(crate::catalog::AccentColor::Blue);
+        hosts[0].alias = "longer-prod-alias".into();
+        hosts[1].alias = "qa".into();
         for host in &mut hosts {
             host.metadata.tags = vec!["prod".into(), "api".into()];
         }
@@ -485,6 +502,15 @@ Match originalhost unknown-port exec "exit 0"
             app.selected = selected;
             let mut terminal = Terminal::new(TestBackend::new(96, 20)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let header = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(96)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .find(|row| row.contains("HostName"))
+                .unwrap();
+            let tag_column = header[..header.find("Tags").unwrap()].chars().count();
             let rows: Vec<_> = terminal
                 .backend()
                 .buffer()
@@ -501,19 +527,56 @@ Match originalhost unknown-port exec "exit 0"
                         .iter()
                         .map(|cell| cell.symbol())
                         .collect::<String>(),
-                    " prod  api "
+                    "prodapi"
                 );
                 assert!(badge_cells.iter().all(
                     |cell| cell.fg == theme::TAG_FG && !cell.modifier.contains(Modifier::BOLD)
                 ));
-                let first = row
+                let caps: Vec<_> = row
                     .iter()
-                    .position(|cell| cell.bg == theme::TAG_BG)
-                    .unwrap();
-                assert_ne!(row[first - 1].bg, theme::TAG_BG);
-                assert_ne!(row[first + 6].bg, theme::TAG_BG); // Gap between badges.
+                    .filter(|cell| matches!(cell.symbol(), "" | ""))
+                    .collect();
+                assert_eq!(caps.len(), 4);
+                let row_bg = if row[1].symbol() == "›" {
+                    theme::SELECT_BG
+                } else {
+                    theme::BG
+                };
+                assert!(caps.iter().all(|cell| cell.fg == theme::TAG_BG
+                    && cell.bg == row_bg
+                    && !cell.modifier.contains(Modifier::BOLD)));
+                assert_eq!(row[tag_column].symbol(), "");
+                assert_eq!(row[tag_column + 5].symbol(), "");
+                assert_eq!(row[tag_column + 6].symbol(), " ");
+                assert_eq!(row[tag_column + 6].bg, row_bg);
+                assert_eq!(row[tag_column + 7].symbol(), "");
             }
         }
+    }
+
+    #[test]
+    fn tag_overflow_stays_in_its_column_beside_a_long_alias_and_connection_flag() {
+        let mut app = app();
+        let mut hosts = app.catalog.hosts().to_vec();
+        hosts[0].alias = "a-very-long-production-alias".into();
+        hosts[0].metadata.tags = vec![
+            "東京東京東京".into(),
+            "e\u{301}".into(),
+            "another-tag".into(),
+        ];
+        app.replace_catalog(Catalog::from_hosts_for_test(hosts));
+        app.verbosity = 3;
+        let screen = rendered(&mut app, 74, 12);
+        let row = line_containing(&screen, "api.internal");
+        assert!(row.contains("a-very-long…   -vvv "), "{row}");
+        assert!(row.contains("東京東京東京 +2"), "{row}");
+        assert!(!row.contains("another-tag"));
+        assert!(!line_containing(&screen, "staging.internal").contains(''));
+        app.filter = "staging".into();
+        app.refresh_filter();
+        let screen = rendered(&mut app, 74, 12);
+        assert!(line_containing(&screen, "HostName").contains("Tags"));
+        assert!(!screen.contains(''));
     }
 
     #[test]
