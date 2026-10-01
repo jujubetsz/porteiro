@@ -7,6 +7,10 @@ an OpenSSH client configuration and hands the selected alias to the user's
 installed `ssh` binary. The name is branding only. Product copy and code use
 standard SSH terminology without extending the name into a metaphor.
 
+Keep source code and code comments in English. Write README.md prose in
+Brazilian Portuguese, preserving commands, configuration keys, example code
+comments, and actual terminal output in their original form.
+
 ## Product contract
 
 - Treat the SSH config as the only source of truth.
